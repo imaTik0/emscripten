@@ -18,6 +18,9 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <set>
+#include <utility>
+#include <tuple>
 #if __cplusplus >= 201703L
 #include <optional>
 #endif
@@ -2033,22 +2036,32 @@ void register_optional() {
 
 namespace internal {
 
+template <typename T, typename Allocator>
+struct BindingType<std::vector<T, Allocator>> {
+    using ValBinding = BindingType<val>;
+    using WireType = ValBinding::WireType;
+
+    static WireType toWireType(const std::vector<T, Allocator> &vec) {
+        std::vector<val> valVec (vec.begin(), vec.end());
+        return BindingType<val>::toWireType(val::array(valVec));
+    }
+
+    static std::vector<T, Allocator> fromWireType(WireType &value) {
+        return vecFromJSArray<T>(ValBinding::fromWireType(value));
+    }
+};
+
+template <typename T>
+struct TypeID<T,
+            typename std::enable_if_t<std::is_same<
+                typename Canonicalized<T>::type,
+                std::vector<typename Canonicalized<T>::type::value_type,
+                            typename Canonicalized<T>::type::allocator_type>>::value>> {
+    static constexpr TYPEID get() { return TypeID<val>::get(); }
+};
+
 template<typename VectorType>
 struct VectorAccess {
-// This nearly duplicated code is used for generating more specific TypeScript
-// types when using more modern C++ versions.
-#if __cplusplus >= 201703L
-    static std::optional<typename VectorType::value_type> get(
-        const VectorType& v,
-        typename VectorType::size_type index
-    ) {
-        if (index < v.size()) {
-            return v[index];
-        } else {
-            return {};
-        }
-    }
-#else
     static val get(
         const VectorType& v,
         typename VectorType::size_type index
@@ -2059,7 +2072,6 @@ struct VectorAccess {
             return val::undefined();
         }
     }
-#endif
 
     static bool set(
         VectorType& v,
@@ -2071,27 +2083,7 @@ struct VectorAccess {
     }
 };
 
-} // end namespace internal
-
-template<typename T>
-class_<std::vector<T>> register_vector(const char* name) {
-    typedef std::vector<T> VecType;
-#if __cplusplus >= 201703L
-    register_optional<T>();
-#endif
-
-    void (VecType::*push_back)(const T&) = &VecType::push_back;
-    void (VecType::*resize)(const size_t, const T&) = &VecType::resize;
-    size_t (VecType::*size)() const = &VecType::size;
-    return class_<std::vector<T>>(name)
-        .template constructor<>()
-        .function("push_back", push_back)
-        .function("resize", resize)
-        .function("size", size)
-        .function("get", &internal::VectorAccess<VecType>::get)
-        .function("set", &internal::VectorAccess<VecType>::set)
-        ;
-}
+} 
 
 ////////////////////////////////////////////////////////////////////////////////
 // MAPS
@@ -2101,21 +2093,6 @@ namespace internal {
 
 template<typename MapType>
 struct MapAccess {
-// This nearly duplicated code is used for generating more specific TypeScript
-// types when using more modern C++ versions.
-#if __cplusplus >= 201703L
-    static std::optional<typename MapType::mapped_type> get(
-        const MapType& m,
-        const typename MapType::key_type& k
-    ) {
-        auto i = m.find(k);
-        if (i == m.end()) {
-            return {};
-        } else {
-            return i->second;
-        }
-    }
-#else
     static val get(
         const MapType& m,
         const typename MapType::key_type& k
@@ -2127,7 +2104,6 @@ struct MapAccess {
             return val(i->second);
         }
     }
-#endif
 
     static void set(
         MapType& m,
@@ -2149,24 +2125,177 @@ struct MapAccess {
     }
 };
 
+template <typename Key, typename Value>
+std::vector<std::pair<Key, Value>> mapToVector(const std::map<Key, Value>& inputMap) {
+    return std::vector<std::pair<Key, Value>>(inputMap.begin(), inputMap.end());
+}
+
+template <typename Key, typename Value, typename Compare, typename Allocator>
+struct BindingType<std::map<Key, Value, Compare, Allocator>> {
+    using ValBinding = BindingType<val>;
+    using WireType = ValBinding::WireType;
+
+    static WireType toWireType(const std::map<Key, Value, Compare, Allocator>& map) {
+        auto vec = mapToVector(map);
+        val array = val::array(mapToVector(map));
+        val jsMap = val::global("Map").new_();
+        for (const auto& pair : map) {
+            jsMap.call<void>("set", val(pair.first), val(pair.second));
+        }
+        return ValBinding::toWireType(jsMap);
+    }
+
+    static std::map<Key, Value, Compare, Allocator> fromWireType(WireType value) {
+        val jsObject = ValBinding::fromWireType(value);
+        std::map<Key, Value, Compare, Allocator> map;
+        val keys = jsObject.call<val>("keys");
+
+        const unsigned int length = keys["length"].as<unsigned int>();
+        for (unsigned int i = 0; i < length; ++i) {
+            Key key = keys[i].template as<Key>();
+            map[key] = jsObject[key].template as<Value>();
+        }
+        return map;
+    }
+};
+
+template <typename Key, typename Value>
+struct TypeID<std::map<Key, Value>,
+              typename std::enable_if_t<std::is_same<
+                  typename Canonicalized<std::map<Key, Value>>::type,
+                  std::map<typename Canonicalized<Key>::type,
+                           typename Canonicalized<Value>::type>>::value>> {
+    static constexpr TYPEID get() { return TypeID<val>::get(); }
+};
+
 } // end namespace internal
 
-template<typename K, typename V>
-class_<std::map<K, V>> register_map(const char* name) {
-    typedef std::map<K,V> MapType;
-#if __cplusplus >= 201703L
-    register_optional<V>();
-#endif
+////////////////////////////////////////////////////////////////////////////////
+// PAIRS
+////////////////////////////////////////////////////////////////////////////////
 
-    size_t (MapType::*size)() const = &MapType::size;
-    return class_<MapType>(name)
-        .template constructor<>()
-        .function("size", size)
-        .function("get", internal::MapAccess<MapType>::get)
-        .function("set", internal::MapAccess<MapType>::set)
-        .function("keys", internal::MapAccess<MapType>::keys)
-        ;
+namespace internal {
+
+template <typename T1, typename T2>
+struct BindingType<std::pair<T1, T2>> {
+    using ValBinding = BindingType<val>;
+    using WireType = ValBinding::WireType;
+
+    static WireType toWireType(const std::pair<T1, T2>& pair) {
+        val jsArray = val::array();
+        jsArray.set(0, pair.first);
+        jsArray.set(1, pair.second);
+        return ValBinding::toWireType(jsArray);
+    }
+
+    static std::pair<T1, T2> fromWireType(WireType value) {
+        val jsArray = ValBinding::fromWireType(value);
+        if (jsArray["length"].as<unsigned>() != 2) {
+            throw std::invalid_argument("Expected array of length 2 for std::pair");
+        }
+        return std::make_pair(
+            jsArray[0].template as<T1>(),
+            jsArray[1].template as<T2>()
+        );
+    }
+};
+
+template <typename T1, typename T2>
+struct TypeID<std::pair<T1, T2>> {
+    static constexpr TYPEID get() { return TypeID<val>::get(); }
+};
+
+} // end namespace internal
+
+
+////////////////////////////////////////////////////////////////////////////////
+// TUPLES
+////////////////////////////////////////////////////////////////////////////////
+
+
+namespace internal {
+
+template <typename Tuple, std::size_t... Is>
+val tupleToJSArray(const Tuple& tuple, std::index_sequence<Is...>) {
+    val jsArray = val::array();
+    (..., jsArray.set(Is, std::get<Is>(tuple)));  // Fold expression to populate the array
+    return jsArray;
 }
+
+template <typename Tuple, std::size_t... Is>
+Tuple jsArrayToTuple(const val& jsArray, std::index_sequence<Is...>) {
+    if (jsArray["length"].as<unsigned>() != sizeof...(Is)) {
+        throw std::invalid_argument("Mismatched array length for tuple conversion");
+    }
+    return std::make_tuple(jsArray[Is].template as<typename std::tuple_element<Is, Tuple>::type>()...);
+}
+
+template <typename... Ts>
+struct BindingType<std::tuple<Ts...>> {
+    using ValBinding = BindingType<val>;
+    using WireType = ValBinding::WireType;
+
+    static WireType toWireType(const std::tuple<Ts...>& tuple) {
+        return tupleToJSArray(tuple, std::make_index_sequence<sizeof...(Ts)>());
+    }
+
+    static std::tuple<Ts...> fromWireType(WireType value) {
+        return jsArrayToTuple<std::tuple<Ts...>>(ValBinding::fromWireType(value), std::make_index_sequence<sizeof...(Ts)>());
+    }
+};
+
+template <typename... Ts>
+struct TypeID<std::tuple<Ts...>> {
+    static constexpr TYPEID get() { return TypeID<val>::get(); }
+};
+
+} // end namespace internal
+
+
+////////////////////////////////////////////////////////////////////////////////
+// SETS
+////////////////////////////////////////////////////////////////////////////////
+
+namespace internal {
+template <typename T, typename Compare, typename Allocator>
+struct BindingType<std::set<T, Compare, Allocator>> {
+    using ValBinding = BindingType<val>;
+    using WireType = ValBinding::WireType;
+
+    static WireType toWireType(const std::set<T, Compare, Allocator>& set) {
+        val jsSet = val::global("Set").new_();  // Create a new JavaScript Set
+        for (const auto& element : set) {
+            jsSet.call<void>("add", element);
+        }
+        return ValBinding::toWireType(jsSet);
+    }
+
+    static std::set<T, Compare, Allocator> fromWireType(WireType value) {
+        val jsSet = ValBinding::fromWireType(value);
+        std::set<T, Compare, Allocator> set;
+        val iterator = jsSet.call<val>("values");
+        val next = iterator.call<val>("next");
+
+        while (!next["done"].as<bool>()) {
+            set.insert(next["value"].template as<T>());  // Use 'template' keyword here
+            next = iterator.call<val>("next");
+        }
+
+        return set;
+    }
+};
+
+template <typename T, typename Compare, typename Allocator>
+struct TypeID<std::set<T, Compare, Allocator>,
+              typename std::enable_if_t<std::is_same<
+                  typename Canonicalized<std::set<T, Compare, Allocator>>::type,
+                  std::set<typename Canonicalized<T>::type,
+                           typename Canonicalized<Compare>::type,
+                           typename Canonicalized<Allocator>::type>>::value>> {
+    static constexpr TYPEID get() { return TypeID<val>::get(); }
+};
+
+} // end namespace internal
 
 ////////////////////////////////////////////////////////////////////////////////
 // std::optional
