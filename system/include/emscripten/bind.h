@@ -2060,29 +2060,6 @@ struct TypeID<T,
     static constexpr TYPEID get() { return TypeID<val>::get(); }
 };
 
-template<typename VectorType>
-struct VectorAccess {
-    static val get(
-        const VectorType& v,
-        typename VectorType::size_type index
-    ) {
-        if (index < v.size()) {
-            return val(v[index]);
-        } else {
-            return val::undefined();
-        }
-    }
-
-    static bool set(
-        VectorType& v,
-        typename VectorType::size_type index,
-        const typename VectorType::value_type& value
-    ) {
-        v[index] = value;
-        return true;
-    }
-};
-
 } 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -2091,53 +2068,12 @@ struct VectorAccess {
 
 namespace internal {
 
-template<typename MapType>
-struct MapAccess {
-    static val get(
-        const MapType& m,
-        const typename MapType::key_type& k
-    ) {
-        auto i = m.find(k);
-        if (i == m.end()) {
-            return val::undefined();
-        } else {
-            return val(i->second);
-        }
-    }
-
-    static void set(
-        MapType& m,
-        const typename MapType::key_type& k,
-        const typename MapType::mapped_type& v
-    ) {
-        m[k] = v;
-    }
-
-    static std::vector<typename MapType::key_type> keys(
-        const MapType& m
-    ) {
-      std::vector<typename MapType::key_type> keys;
-      keys.reserve(m.size());
-      for (const auto& pair : m) {
-        keys.push_back(pair.first);
-      }
-      return keys;
-    }
-};
-
-template <typename Key, typename Value>
-std::vector<std::pair<Key, Value>> mapToVector(const std::map<Key, Value>& inputMap) {
-    return std::vector<std::pair<Key, Value>>(inputMap.begin(), inputMap.end());
-}
-
 template <typename Key, typename Value, typename Compare, typename Allocator>
 struct BindingType<std::map<Key, Value, Compare, Allocator>> {
     using ValBinding = BindingType<val>;
     using WireType = ValBinding::WireType;
 
     static WireType toWireType(const std::map<Key, Value, Compare, Allocator>& map) {
-        auto vec = mapToVector(map);
-        val array = val::array(mapToVector(map));
         val jsMap = val::global("Map").new_();
         for (const auto& pair : map) {
             jsMap.call<void>("set", val(pair.first), val(pair.second));
