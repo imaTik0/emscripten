@@ -448,7 +448,7 @@ struct GetReturnValuePolicy<ReturnType, return_value_policy::reference, Rest...>
 
 template<typename ReturnType, typename T, typename... Rest>
 struct GetReturnValuePolicy<ReturnType, T, Rest...> {
-    using tag = GetReturnValuePolicy<ReturnType, Rest...>::tag;
+    using tag = typename GetReturnValuePolicy<ReturnType, Rest...>::tag;
 };
 
 template<typename... Policies>
@@ -669,7 +669,7 @@ template<typename ReturnType, typename... Args, typename... Policies>
 void function(const char* name, ReturnType (*fn)(Args...), Policies...) {
     using namespace internal;
     typename WithPolicies<Policies...>::template ArgTypeList<ReturnType, Args...> args;
-    using ReturnPolicy = GetReturnValuePolicy<ReturnType, Policies...>::tag;
+    using ReturnPolicy = typename GetReturnValuePolicy<ReturnType, Policies...>::tag;
     auto invoke = Invoker<ReturnPolicy, ReturnType, Args...>::invoke;
     _embind_register_function(
         name,
@@ -1530,7 +1530,7 @@ struct RegisterClassMethod<ReturnType (ClassType::*)(Args...)> {
     template <typename CT, typename... Policies>
     static void invoke(const char* methodName,
                        ReturnType (ClassType::*memberFunction)(Args...)) {
-        using ReturnPolicy = GetReturnValuePolicy<ReturnType, Policies...>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<ReturnType, Policies...>::tag;
         auto invoke = MethodInvoker<ReturnPolicy, decltype(memberFunction), ReturnType, ClassType*, Args...>::invoke;
 
         typename WithPolicies<Policies...>::template ArgTypeList<ReturnType, AllowedRawPointer<ClassType>, Args...> args;
@@ -1560,7 +1560,7 @@ struct RegisterClassMethod<ReturnType (ClassType::*)(Args...) const> {
     template <typename CT, typename... Policies>
     static void invoke(const char* methodName,
                        ReturnType (ClassType::*memberFunction)(Args...) const)  {
-        using ReturnPolicy = GetReturnValuePolicy<ReturnType, Policies...>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<ReturnType, Policies...>::tag;
         auto invoke = MethodInvoker<ReturnPolicy, decltype(memberFunction), ReturnType, const ClassType*, Args...>::invoke;
 
         typename WithPolicies<Policies...>::template ArgTypeList<ReturnType, AllowedRawPointer<const ClassType>, Args...> args;
@@ -1591,7 +1591,7 @@ struct RegisterClassMethod<ReturnType (*)(ThisType, Args...)> {
     static void invoke(const char* methodName,
                        ReturnType (*function)(ThisType, Args...)) {
         typename WithPolicies<Policies...>::template ArgTypeList<ReturnType, ThisType, Args...> args;
-        using ReturnPolicy = GetReturnValuePolicy<ReturnType, Policies...>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<ReturnType, Policies...>::tag;
         auto invoke = FunctionInvoker<ReturnPolicy, decltype(function), ReturnType, ThisType, Args...>::invoke;
         _embind_register_class_function(
             TypeID<ClassType>::get(),
@@ -1620,7 +1620,7 @@ struct RegisterClassMethod<std::function<ReturnType (ThisType, Args...)>> {
     static void invoke(const char* methodName,
                        std::function<ReturnType (ThisType, Args...)> function) {
         typename WithPolicies<Policies...>::template ArgTypeList<ReturnType, ThisType, Args...> args;
-        using ReturnPolicy = GetReturnValuePolicy<ReturnType, Policies...>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<ReturnType, Policies...>::tag;
         auto invoke = FunctorInvoker<ReturnPolicy, decltype(function), ReturnType, ThisType, Args...>::invoke;
         _embind_register_class_function(
             TypeID<ClassType>::get(),
@@ -1643,7 +1643,7 @@ struct RegisterClassMethod<ReturnType (ThisType, Args...)> {
     static void invoke(const char* methodName,
                        Callable& callable) {
         typename WithPolicies<Policies...>::template ArgTypeList<ReturnType, ThisType, Args...> args;
-        using ReturnPolicy = GetReturnValuePolicy<ReturnType, Policies...>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<ReturnType, Policies...>::tag;
         auto invoke = FunctorInvoker<ReturnPolicy, decltype(callable), ReturnType, ThisType, Args...>::invoke;
         _embind_register_class_function(
             TypeID<ClassType>::get(),
@@ -1755,7 +1755,7 @@ public:
         smart_ptr<SmartPtr>(smartPtrName);
 
         typename WithPolicies<Policies...>::template ArgTypeList<SmartPtr, Args...> args;
-        using ReturnPolicy = GetReturnValuePolicy<SmartPtr, return_value_policy::take_ownership>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<SmartPtr, return_value_policy::take_ownership>::tag;
         auto invoke = &Invoker<ReturnPolicy, SmartPtr, Args...>::invoke;
         _embind_register_class_constructor(
             TypeID<ClassType>::get(),
@@ -1838,7 +1838,7 @@ public:
             internal::conjunction<internal::isPolicy<Policies>...>::value>::type>
     EMSCRIPTEN_ALWAYS_INLINE const class_& property(const char* fieldName, const FieldType ClassType::*field, Policies...) const {
         using namespace internal;
-        using ReturnPolicy = GetReturnValuePolicy<FieldType, Policies...>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<FieldType, Policies...>::tag;
         typename WithPolicies<Policies...>::template ArgTypeList<FieldType> returnType;
 
         auto getter = &MemberAccess<ClassType, FieldType>::template getWire<ClassType, ReturnPolicy>;
@@ -1866,7 +1866,7 @@ public:
             internal::conjunction<internal::isPolicy<Policies>...>::value>::type>
     EMSCRIPTEN_ALWAYS_INLINE const class_& property(const char* fieldName, FieldType ClassType::*field, Policies...) const {
         using namespace internal;
-        using ReturnPolicy = GetReturnValuePolicy<FieldType, Policies...>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<FieldType, Policies...>::tag;
         typename WithPolicies<Policies...>::template ArgTypeList<FieldType> returnType;
 
         auto getter = &MemberAccess<ClassType, FieldType>::template getWire<ClassType, ReturnPolicy>;
@@ -1900,7 +1900,7 @@ public:
             typename std::conditional<std::is_same<PropertyType, internal::DeduceArgumentsTag>::value,
                                                    Getter,
                                                    PropertyTag<Getter, PropertyType>>::type> GP;
-        using ReturnPolicy = GetReturnValuePolicy<typename GP::ReturnType, Policies...>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<typename GP::ReturnType, Policies...>::tag;
         auto gter = &GP::template get<ClassType, ReturnPolicy>;
         typename WithPolicies<Policies...>::template ArgTypeList<typename GP::ReturnType> returnType;
         _embind_register_class_property(
@@ -1928,7 +1928,7 @@ public:
         typename = typename std::enable_if<!internal::isPolicy<Setter>::value>::type>
     EMSCRIPTEN_ALWAYS_INLINE const class_& property(const char* fieldName, Getter getter, Setter setter, Policies...) const {
         using namespace internal;
-        using ReturnPolicy = GetReturnValuePolicy<PropertyType, Policies...>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<PropertyType, Policies...>::tag;
 
         typedef GetterPolicy<
             typename std::conditional<std::is_same<PropertyType, internal::DeduceArgumentsTag>::value,
@@ -1962,7 +1962,7 @@ public:
         using namespace internal;
 
         typename WithPolicies<Policies...>::template ArgTypeList<ReturnType, Args...> args;
-        using ReturnPolicy = GetReturnValuePolicy<ReturnType, Policies...>::tag;
+        using ReturnPolicy = typename GetReturnValuePolicy<ReturnType, Policies...>::tag;
         auto invoke = internal::Invoker<ReturnPolicy, ReturnType, Args...>::invoke;
         _embind_register_class_class_function(
             TypeID<ClassType>::get(),
@@ -2041,9 +2041,9 @@ struct BindingType<std::vector<T, Allocator>> {
     using ValBinding = BindingType<val>;
     using WireType = ValBinding::WireType;
 
-    static WireType toWireType(const std::vector<T, Allocator> &vec) {
+    static WireType toWireType(const std::vector<T, Allocator> &vec, rvp::default_tag) {
         std::vector<val> valVec (vec.begin(), vec.end());
-        return BindingType<val>::toWireType(val::array(valVec));
+        return BindingType<val>::toWireType(val::array(valVec), rvp::default_tag{});
     }
 
     static std::vector<T, Allocator> fromWireType(WireType &value) {
@@ -2073,12 +2073,12 @@ struct BindingType<std::map<Key, Value, Compare, Allocator>> {
     using ValBinding = BindingType<val>;
     using WireType = ValBinding::WireType;
 
-    static WireType toWireType(const std::map<Key, Value, Compare, Allocator>& map) {
+    static WireType toWireType(const std::map<Key, Value, Compare, Allocator>& map, rvp::default_tag) {
         val jsMap = val::global("Map").new_();
         for (const auto& pair : map) {
             jsMap.call<void>("set", val(pair.first), val(pair.second));
         }
-        return ValBinding::toWireType(jsMap);
+        return ValBinding::toWireType(jsMap, rvp::default_tag{});
     }
 
     static std::map<Key, Value, Compare, Allocator> fromWireType(WireType value) {
@@ -2117,11 +2117,11 @@ struct BindingType<std::pair<T1, T2>> {
     using ValBinding = BindingType<val>;
     using WireType = ValBinding::WireType;
 
-    static WireType toWireType(const std::pair<T1, T2>& pair) {
+    static WireType toWireType(const std::pair<T1, T2>& pair, rvp::default_tag) {
         val jsArray = val::array();
         jsArray.set(0, pair.first);
         jsArray.set(1, pair.second);
-        return ValBinding::toWireType(jsArray);
+        return ValBinding::toWireType(jsArray, rvp::default_tag{});
     }
 
     static std::pair<T1, T2> fromWireType(WireType value) {
@@ -2171,8 +2171,8 @@ struct BindingType<std::tuple<Ts...>> {
     using ValBinding = BindingType<val>;
     using WireType = ValBinding::WireType;
 
-    static WireType toWireType(const std::tuple<Ts...>& tuple) {
-        return tupleToJSArray(tuple, std::make_index_sequence<sizeof...(Ts)>());
+    static WireType toWireType(const std::tuple<Ts...>& tuple,  rvp::default_tag) {
+        return BindingType<val>::toWireType(tupleToJSArray(tuple, std::make_index_sequence<sizeof...(Ts)>()), rvp::default_tag{});
     }
 
     static std::tuple<Ts...> fromWireType(WireType value) {
@@ -2203,7 +2203,7 @@ struct BindingType<std::set<T, Compare, Allocator>> {
         for (const auto& element : set) {
             jsSet.call<void>("add", element);
         }
-        return ValBinding::toWireType(jsSet);
+        return ValBinding::toWireType(jsSet, rvp::default_tag{});
     }
 
     static std::set<T, Compare, Allocator> fromWireType(WireType value) {
