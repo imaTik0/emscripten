@@ -2039,11 +2039,17 @@ namespace internal {
 template <typename T, typename Allocator>
 struct BindingType<std::vector<T, Allocator>> {
     using ValBinding = BindingType<val>;
-    using WireType = ValBinding::WireType;
+    using WireType = typename ValBinding::WireType;
 
     static WireType toWireType(const std::vector<T, Allocator> &vec, rvp::default_tag) {
-        std::vector<val> valVec (vec.begin(), vec.end());
-        return BindingType<val>::toWireType(val::array(valVec), rvp::default_tag{});
+        if constexpr (internal::typeSupportsMemoryView<T>()) {
+            return BindingType<val>::toWireType(val::array(vec), rvp::default_tag{});
+        }
+        val jsArray = val::array();
+        for (std::size_t i = 0; i < vec.size(); ++i) {
+            jsArray.set(i, BindingType<T>::toWireType(vec[i], rvp::default_tag{}));
+        }
+        return BindingType<val>::toWireType(jsArray, rvp::default_tag{});
     }
 
     static std::vector<T, Allocator> fromWireType(WireType &value) {
