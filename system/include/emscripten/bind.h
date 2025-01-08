@@ -2082,20 +2082,22 @@ struct BindingType<std::map<Key, Value, Compare, Allocator>> {
     static WireType toWireType(const std::map<Key, Value, Compare, Allocator>& map, rvp::default_tag) {
         val jsMap = val::global("Map").new_();
         for (const auto& pair : map) {
-            jsMap.call<void>("set", val(pair.first), val(pair.second));
+            auto jsKey = BindingType<Key>::toWireType(pair.first, rvp::default_tag{});
+            auto jsValue = BindingType<Value>::toWireType(pair.second, rvp::default_tag{});
+            jsMap.call<void>("set", val(jsKey), val(jsValue));
         }
         return ValBinding::toWireType(jsMap, rvp::default_tag{});
     }
 
     static std::map<Key, Value, Compare, Allocator> fromWireType(WireType value) {
-        val jsObject = ValBinding::fromWireType(value);
+        val jsMap = ValBinding::fromWireType(value);
         std::map<Key, Value, Compare, Allocator> map;
-        val keys = jsObject.call<val>("keys");
+        val iterator = jsMap.call<val>("entries");
+        val next = iterator.call<val>("next");
 
-        const unsigned int length = keys["length"].as<unsigned int>();
-        for (unsigned int i = 0; i < length; ++i) {
-            Key key = keys[i].template as<Key>();
-            map[key] = jsObject[key].template as<Value>();
+        while (!next["done"].as<bool>()) {
+            map[next["value"][0].as<Key>()] = next["value"][1].as<Value>();
+            next = iterator.call<val>("next");
         }
         return map;
     }
@@ -2125,8 +2127,8 @@ struct BindingType<std::pair<T1, T2>> {
 
     static WireType toWireType(const std::pair<T1, T2>& pair, rvp::default_tag) {
         val jsArray = val::array();
-        jsArray.set(0, pair.first);
-        jsArray.set(1, pair.second);
+        jsArray.set(0, BindingType<T1>::toWireType(pair.first, rvp::default_tag{}));
+        jsArray.set(1, BindingType<T2>::toWireType(pair.second, rvp::default_tag{}));
         return ValBinding::toWireType(jsArray, rvp::default_tag{});
     }
 
@@ -2136,8 +2138,8 @@ struct BindingType<std::pair<T1, T2>> {
             throw std::invalid_argument("Expected array of length 2 for std::pair");
         }
         return std::make_pair(
-            jsArray[0].template as<T1>(),
-            jsArray[1].template as<T2>()
+            jsArray[0].as<T1>(),
+            jsArray[1].as<T2>()
         );
     }
 };
@@ -2160,7 +2162,7 @@ namespace internal {
 template <typename Tuple, std::size_t... Is>
 val tupleToJSArray(const Tuple& tuple, std::index_sequence<Is...>) {
     val jsArray = val::array();
-    (..., jsArray.set(Is, std::get<Is>(tuple)));  // Fold expression to populate the array
+    (..., jsArray.set(Is, BindingType<typename std::tuple_element<Is, Tuple>::type>::toWireType(std::get<Is>(tuple), rvp::default_tag{})));  // Fold expression to populate the array
     return jsArray;
 }
 
@@ -2169,7 +2171,7 @@ Tuple jsArrayToTuple(const val& jsArray, std::index_sequence<Is...>) {
     if (jsArray["length"].as<unsigned>() != sizeof...(Is)) {
         throw std::invalid_argument("Mismatched array length for tuple conversion");
     }
-    return std::make_tuple(jsArray[Is].template as<typename std::tuple_element<Is, Tuple>::type>()...);
+    return std::make_tuple(jsArray[Is].as<typename std::tuple_element<Is, Tuple>::type>()...);
 }
 
 template <typename... Ts>
@@ -2204,10 +2206,11 @@ struct BindingType<std::set<T, Compare, Allocator>> {
     using ValBinding = BindingType<val>;
     using WireType = ValBinding::WireType;
 
-    static WireType toWireType(const std::set<T, Compare, Allocator>& set) {
+    static WireType toWireType(const std::set<T, Compare, Allocator>& set, rvp::default_tag) {
         val jsSet = val::global("Set").new_();  // Create a new JavaScript Set
-        for (const auto& element : set) {
-            jsSet.call<void>("add", element);
+        for (const auto& element : set) { 
+            auto wire = BindingType<T>::toWireType(element, rvp::default_tag{});
+            jsSet.call<void>("add", val(wire));
         }
         return ValBinding::toWireType(jsSet, rvp::default_tag{});
     }
@@ -2219,7 +2222,7 @@ struct BindingType<std::set<T, Compare, Allocator>> {
         val next = iterator.call<val>("next");
 
         while (!next["done"].as<bool>()) {
-            set.insert(next["value"].template as<T>());  // Use 'template' keyword here
+            set.insert(next["value"].as<T>());  // Use 'template' keyword here
             next = iterator.call<val>("next");
         }
 
