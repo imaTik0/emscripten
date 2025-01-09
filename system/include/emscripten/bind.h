@@ -2207,7 +2207,11 @@ struct BindingType<std::set<T, Compare, Allocator>> {
     using WireType = ValBinding::WireType;
 
     static WireType toWireType(const std::set<T, Compare, Allocator>& set, rvp::default_tag) {
-        val jsSet = val::global("Set").new_();  // Create a new JavaScript Set
+        if constexpr (internal::typeSupportsMemoryView<T>()) {
+            std::vector<T> valueVector(set.begin(), set.end());
+            return ValBinding::toWireType(val::global("Set").new_(val::array(valueVector)), rvp::default_tag{});
+        }
+        val jsSet = val::global("Set").new_();
         for (const auto& element : set) { 
             auto wire = BindingType<T>::toWireType(element, rvp::default_tag{});
             jsSet.call<void>("add", val(wire));
