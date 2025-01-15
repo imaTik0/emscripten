@@ -2169,6 +2169,11 @@ var LEGACY_RUNTIME = false;
 // [link]
 var SIGNATURE_CONVERSIONS = [];
 
+// Converts arrays created by emval_new_array_from_memory_view into packed arrays.
+// Enabling this option is beneficial only on the V8 JavaScript engine. Tt slows down array creation from a view
+// but significantly speeds up access to its elements.
+var PACKED_ARRAYS_V8 = false;
+
 //===========================================
 // Internal, used for testing only, from here
 //===========================================

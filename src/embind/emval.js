@@ -126,6 +126,10 @@ var LibraryEmVal = {
   _emval_new_array_from_memory_view: (view) => {
     view = Emval.toValue(view);
     // using for..loop is faster than Array.from
+    #if PACKED_ARRAYS_V8
+      var a = Array.from(view);
+      return Emval.toHandle(a);
+    #endif
     var a = new Array(view.length);
     for (var i = 0; i < view.length; i++) a[i] = view[i];
     return Emval.toHandle(a);
