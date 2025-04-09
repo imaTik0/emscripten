@@ -20,14 +20,14 @@
 // after the generated code, you will need to define   var Module = {};
 // before the code. Then that object will be used in the code, and you
 // can continue to use Module afterwards as well.
-#if MODULARIZE
+#if WASM_ESM_INTEGRATION
+var Module;
+#elif MODULARIZE
 var Module = moduleArg;
 #elif USE_CLOSURE_COMPILER
+/** @type{Object} */
+var Module;
 // if (!Module)` is crucial for Closure Compiler here as it will otherwise replace every `Module` occurrence with a string
-var /** @type {{
-  ctx: Object,
-}}
- */ Module;
 if (!Module) /** @suppress{checkTypes}*/Module = {"__EMSCRIPTEN_PRIVATE_MODULE_EXPORT_NAME_SUBSTITUTION__":1};
 #elif AUDIO_WORKLET
 var Module = globalThis.Module || (typeof {{{ EXPORT_NAME }}} != 'undefined' ? {{{ EXPORT_NAME }}} : {});
@@ -36,27 +36,9 @@ var Module = typeof {{{ EXPORT_NAME }}} != 'undefined' ? {{{ EXPORT_NAME }}} : {
 #endif // USE_CLOSURE_COMPILER
 
 #if POLYFILL
-#if ((MAYBE_WASM2JS && WASM != 2) || MODULARIZE) && (MIN_CHROME_VERSION < 33 || MIN_FIREFOX_VERSION < 29 || MIN_SAFARI_VERSION < 80000)
-// Include a Promise polyfill for legacy browsers. This is needed either for
-// wasm2js, where we polyfill the wasm API which needs Promises, or when using
-// modularize which creates a Promise for when the module is ready.
-// See https://caniuse.com/#feat=promises
-#include "polyfill/promise.js"
-#endif
-
-#if MIN_CHROME_VERSION < 45 || MIN_FIREFOX_VERSION < 34 || MIN_SAFARI_VERSION < 90000
-// See https://caniuse.com/mdn-javascript_builtins_object_assign
-#include "polyfill/objassign.js"
-#endif
-
 #if WASM_BIGINT && MIN_SAFARI_VERSION < 150000
 // See https://caniuse.com/mdn-javascript_builtins_bigint64array
 #include "polyfill/bigint64array.js"
-#endif
-
-#if MIN_CHROME_VERSION < 40 || MIN_FIREFOX_VERSION < 39 || MIN_SAFARI_VERSION < 103000
-// See https://caniuse.com/fetch
-#include "polyfill/fetch.js"
 #endif
 #endif // POLYFILL
 
@@ -67,9 +49,6 @@ var readyPromise = new Promise((resolve, reject) => {
   readyPromiseResolve = resolve;
   readyPromiseReject = reject;
 });
-#if ASSERTIONS
-{{{ addReadyPromiseAssertions() }}}
-#endif
 #endif
 
 // Determine the runtime environment we are in. You can customize this by
@@ -123,18 +102,12 @@ if (ENVIRONMENT_IS_PTHREAD) {
 
 #if ENVIRONMENT_MAY_BE_NODE
 if (ENVIRONMENT_IS_NODE) {
-  // `require()` is no-op in an ESM module, use `createRequire()` to construct
-  // the require()` function.  This is only necessary for multi-environment
-  // builds, `-sENVIRONMENT=node` emits a static import declaration instead.
-  // TODO: Swap all `require()`'s with `import()`'s?
-#if EXPORT_ES6 && ENVIRONMENT_MAY_BE_WEB
+#if EXPORT_ES6
+  // When building an ES module `require` is not normally available.
+  // We need to use `createRequire()` to construct the require()` function.
   const { createRequire } = await import('module');
-  let dirname = import.meta.url;
-  if (dirname.startsWith("data:")) {
-    dirname = '/';
-  }
   /** @suppress{duplicate} */
-  var require = createRequire(dirname);
+  var require = createRequire(import.meta.url);
 #endif
 
 #if PTHREADS || WASM_WORKERS
@@ -151,19 +124,12 @@ if (ENVIRONMENT_IS_NODE) {
 #endif // ENVIRONMENT_MAY_BE_NODE
 
 #if WASM_WORKERS
-var ENVIRONMENT_IS_WASM_WORKER = Module['$ww'];
+var ENVIRONMENT_IS_WASM_WORKER = !!Module['$ww'];
 #endif
 
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
 {{{ preJS() }}}
-
-// Sometimes an existing Module object exists with properties
-// meant to overwrite the default module functionality. Here
-// we collect those properties and reapply _after_ we configure
-// the current environment's defaults to avoid having to be so
-// defensive during initialization.
-var moduleOverrides = Object.assign({}, Module);
 
 var arguments_ = [];
 var thisProgram = './this.program';
@@ -241,15 +207,14 @@ if (ENVIRONMENT_IS_NODE) {
 
 #include "node_shell_read.js"
 
-  if (!Module['thisProgram'] && process.argv.length > 1) {
+  if (process.argv.length > 1) {
     thisProgram = process.argv[1].replace(/\\/g, '/');
   }
 
   arguments_ = process.argv.slice(2);
 
-#if MODULARIZE
+#if !MODULARIZE
   // MODULARIZE will export the module in the proper place outside, we don't need to export here
-#else
   if (typeof module != 'undefined') {
     module['exports'] = Module;
   }
@@ -310,16 +275,12 @@ if (ENVIRONMENT_IS_SHELL) {
     return data;
   };
 
-  readAsync = (f) => {
-    return new Promise((resolve, reject) => {
-      setTimeout(() => resolve(readBinary(f)));
-    });
-  };
+  readAsync = async (f) => readBinary(f);
 
   globalThis.clearTimeout ??= (id) => {};
 
   // spidermonkey lacks setTimeout but we use it above in readAsync.
-  globalThis.setTimeout ??= (f) => (typeof f == 'function') ? f() : abort();
+  globalThis.setTimeout ??= (f) => f();
 
   // v8 uses `arguments_` whereas spidermonkey uses `scriptArgs`
   arguments_ = globalThis.arguments || globalThis.scriptArgs;
@@ -393,7 +354,7 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
   if (scriptDirectory.startsWith('blob:')) {
     scriptDirectory = '';
   } else {
-    scriptDirectory = scriptDirectory.substr(0, scriptDirectory.replace(/[?#].*/, '').lastIndexOf('/')+1);
+    scriptDirectory = scriptDirectory.slice(0, scriptDirectory.replace(/[?#].*/, '').lastIndexOf('/')+1);
   }
 
 #if ENVIRONMENT && ASSERTIONS
@@ -429,48 +390,20 @@ if (!ENVIRONMENT_IS_AUDIO_WORKLET)
 var defaultPrint = console.log.bind(console);
 var defaultPrintErr = console.error.bind(console);
 if (ENVIRONMENT_IS_NODE) {
-  defaultPrint = (...args) => fs.writeSync(1, args.join(' ') + '\n');
-  defaultPrintErr = (...args) => fs.writeSync(2, args.join(' ') + '\n');
+  var utils = require('util');
+  var stringify = (a) => typeof a == 'object' ? utils.inspect(a) : a;
+  defaultPrint = (...args) => fs.writeSync(1, args.map(stringify).join(' ') + '\n');
+  defaultPrintErr = (...args) => fs.writeSync(2, args.map(stringify).join(' ') + '\n');
 }
-{{{ makeModuleReceiveWithVar('out', 'print',    'defaultPrint',    true) }}}
-{{{ makeModuleReceiveWithVar('err', 'printErr', 'defaultPrintErr', true) }}}
+{{{ makeModuleReceiveWithVar('out', 'print',    'defaultPrint') }}}
+{{{ makeModuleReceiveWithVar('err', 'printErr', 'defaultPrintErr') }}}
 #else
-{{{ makeModuleReceiveWithVar('out', 'print',    'console.log.bind(console)',  true) }}}
-{{{ makeModuleReceiveWithVar('err', 'printErr', 'console.error.bind(console)', true) }}}
+{{{ makeModuleReceiveWithVar('out', 'print',    'console.log.bind(console)') }}}
+{{{ makeModuleReceiveWithVar('err', 'printErr', 'console.error.bind(console)') }}}
 #endif
 
-// Merge back in the overrides
-Object.assign(Module, moduleOverrides);
-// Free the object hierarchy contained in the overrides, this lets the GC
-// reclaim data used.
-moduleOverrides = null;
 #if ASSERTIONS
-checkIncomingModuleAPI();
-#endif
 
-// Emit code to handle expected values on the Module object. This applies Module.x
-// to the proper local x. This has two benefits: first, we only emit it if it is
-// expected to arrive, and second, by using a local everywhere else that can be
-// minified.
-{{{ makeModuleReceive('arguments_', 'arguments') }}}
-{{{ makeModuleReceive('thisProgram') }}}
-
-// perform assertions in shell.js after we set up out() and err(), as otherwise if an assertion fails it cannot print the message
-#if ASSERTIONS
-// Assertions on removed incoming Module JS APIs.
-assert(typeof Module['memoryInitializerPrefixURL'] == 'undefined', 'Module.memoryInitializerPrefixURL option was removed, use Module.locateFile instead');
-assert(typeof Module['pthreadMainPrefixURL'] == 'undefined', 'Module.pthreadMainPrefixURL option was removed, use Module.locateFile instead');
-assert(typeof Module['cdInitializerPrefixURL'] == 'undefined', 'Module.cdInitializerPrefixURL option was removed, use Module.locateFile instead');
-assert(typeof Module['filePackagePrefixURL'] == 'undefined', 'Module.filePackagePrefixURL option was removed, use Module.locateFile instead');
-assert(typeof Module['read'] == 'undefined', 'Module.read option was removed');
-assert(typeof Module['readAsync'] == 'undefined', 'Module.readAsync option was removed (modify readAsync in JS)');
-assert(typeof Module['readBinary'] == 'undefined', 'Module.readBinary option was removed (modify readBinary in JS)');
-assert(typeof Module['setWindowTitle'] == 'undefined', 'Module.setWindowTitle option was removed (modify emscripten_set_window_title in JS)');
-assert(typeof Module['TOTAL_MEMORY'] == 'undefined', 'Module.TOTAL_MEMORY has been renamed Module.INITIAL_MEMORY');
-{{{ makeRemovedModuleAPIAssert('asm', 'wasmExports', false) }}}
-{{{ makeRemovedModuleAPIAssert('readAsync') }}}
-{{{ makeRemovedModuleAPIAssert('readBinary') }}}
-{{{ makeRemovedModuleAPIAssert('setWindowTitle') }}}
 {{{ makeRemovedFSAssert('IDBFS') }}}
 {{{ makeRemovedFSAssert('PROXYFS') }}}
 {{{ makeRemovedFSAssert('WORKERFS') }}}
@@ -483,6 +416,8 @@ assert(typeof Module['TOTAL_MEMORY'] == 'undefined', 'Module.TOTAL_MEMORY has be
 {{{ makeRemovedFSAssert('NODEFS') }}}
 #endif
 
+// perform assertions in shell.js after we set up out() and err(), as otherwise
+// if an assertion fails it cannot print the message
 #if PTHREADS
 assert(
 #if AUDIO_WORKLET

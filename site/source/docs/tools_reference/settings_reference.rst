@@ -23,6 +23,7 @@ Whether we should add runtime assertions. This affects both JS and how
 system libraries are built.
 ASSERTIONS == 2 gives even more runtime checks, that may be very slow. That
 includes internal dlmalloc assertions, for example.
+ASSERTIONS defaults to 0 in optimized builds (-O1 and above).
 
 Default value: 1
 
@@ -304,8 +305,6 @@ Assumes WASM_BIGINT.
 
 .. note:: Applicable during both linking and compilation
 
-.. note:: This is an experimental setting
-
 Default value: 0
 
 .. _initial_table:
@@ -470,6 +469,8 @@ emulated values may not match (this is true of native too, for that matter -
 this is all undefined behavior). This approaches appears good enough to
 support Python, which is the main use case motivating this feature.
 
+.. note:: This setting is deprecated
+
 Default value: false
 
 .. _exception_debug:
@@ -478,17 +479,6 @@ EXCEPTION_DEBUG
 ===============
 
 Print out exceptions in emscriptened code.
-
-Default value: false
-
-.. _demangle_support:
-
-DEMANGLE_SUPPORT
-================
-
-If 1, export `demangle` and `stackTrace` JS library functions.
-
-.. note:: This setting is deprecated
 
 Default value: false
 
@@ -1157,16 +1147,19 @@ This option implies EXPORT_EXCEPTION_HANDLING_HELPERS.
 
 Default value: false
 
-.. _wasm_exnref:
+.. _wasm_legacy_exceptions:
 
-WASM_EXNREF
-===========
+WASM_LEGACY_EXCEPTIONS
+======================
 
-Emit instructions for the new Wasm exception handling proposal with exnref,
-which was adopted on Oct 2023. The implementation of the new proposal is
-still in progress and this feature is currently experimental.
+If true, emit instructions for the legacy Wasm exception handling proposal:
+https://github.com/WebAssembly/exception-handling/blob/main/proposals/exception-handling/legacy/Exceptions.md
+If false, emit instructions for the standardized exception handling proposal:
+https://github.com/WebAssembly/exception-handling/blob/main/proposals/exception-handling/Exceptions.md
 
-Default value: false
+.. note:: Applicable during both linking and compilation
+
+Default value: true
 
 .. _nodejs_catch_exit:
 
@@ -1419,7 +1412,7 @@ A list of imported module functions that will potentially do asynchronous
 work. The imported function should return a ``Promise`` when doing
 asynchronous work.
 
-Note when using ``--js-library``, the function can be marked with
+Note when using JS library files, the function can be marked with
 ``<function_name>_async:: true`` in the library instead of this setting.
 
 Default value: []
@@ -1435,17 +1428,6 @@ EXPORTED_RUNTIME_METHODS for things you want to export from the runtime.
 Note that the name may be slightly misleading, as this is for any JS library
 element, and not just methods. For example, we can export the FS object by
 having "FS" in this list.
-
-Default value: []
-
-.. _extra_exported_runtime_methods:
-
-EXTRA_EXPORTED_RUNTIME_METHODS
-==============================
-
-Deprecated, use EXPORTED_RUNTIME_METHODS instead.
-
-.. note:: This setting is deprecated
 
 Default value: []
 
@@ -1947,6 +1929,22 @@ factory function, you can use --extern-pre-js or --extern-post-js. While
 intended usage is to add code that is optimized with the rest of the emitted
 code, allowing better dead code elimination and minification.
 
+Experimental Feature - Instance ES Modules:
+
+Note this feature is still under active development and is subject to change!
+
+To enable this feature use -sMODULARIZE=instance. Enabling this mode will
+produce an ES module that is a singleton with ES module exports. The
+module will export a default value that is an async init function and will
+also export named values that correspond to the Wasm exports and runtime
+exports. The init function must be called before any of the exports can be
+used. An example of using the module is below.
+
+  import init, { foo, bar } from "./my_module.mjs"
+  await init(optionalArguments);
+  foo();
+  bar();
+
 Default value: false
 
 .. _export_es6:
@@ -1960,18 +1958,6 @@ be enabled for ES6 exports and is implicitly enabled if not already set.
 This is implicitly enabled if the output suffix is set to 'mjs'.
 
 Default value: false
-
-.. _use_es6_import_meta:
-
-USE_ES6_IMPORT_META
-===================
-
-Use the ES6 Module relative import feature 'import.meta.url'
-to auto-detect WASM Module path.
-It might not be supported on old browsers / toolchains. This setting
-may not be disabled when Node.js is targeted (-sENVIRONMENT=*node*).
-
-Default value: true
 
 .. _export_name:
 
@@ -2170,10 +2156,9 @@ WASM_BIGINT
 
 WebAssembly integration with JavaScript BigInt. When enabled we don't need to
 legalize i64s into pairs of i32s, as the wasm VM will use a BigInt where an
-i64 is used. If WASM_BIGINT is present, the default minimum supported browser
-versions will be increased to the min version that supports BigInt.
+i64 is used.
 
-Default value: false
+Default value: true
 
 .. _emit_producers_section:
 
@@ -2719,7 +2704,7 @@ Default value: 0
 TEXTDECODER
 ===========
 
-Is enabled, use the JavaScript TextDecoder API for string marshalling.
+If enabled, use the JavaScript TextDecoder API for string marshalling.
 Enabled by default, set this to 0 to disable.
 If set to 2, we assume TextDecoder is present and usable, and do not emit
 any JS code to fall back if it is missing. In single threaded -Oz build modes,
@@ -2889,7 +2874,8 @@ are desired to work. Pass -sMIN_FIREFOX_VERSION=majorVersion to drop support
 for Firefox versions older than < majorVersion.
 Firefox 79 was released on 2020-07-28.
 MAX_INT (0x7FFFFFFF, or -1) specifies that target is not supported.
-Minimum supported value is 34 which was released on 2014-12-01.
+Minimum supported value is 40 which was released on 2015-09-11 (see
+feature_matrix.py)
 
 Default value: 79
 
@@ -2908,9 +2894,10 @@ NOTE: Emscripten is unable to produce code that would work in iOS 9.3.5 and
 older, i.e. iPhone 4s, iPad 2, iPad 3, iPad Mini 1, Pod Touch 5 and older,
 see https://github.com/emscripten-core/emscripten/pull/7191.
 MAX_INT (0x7FFFFFFF, or -1) specifies that target is not supported.
-Minimum supported value is 90000 which was released in 2015.
+Minimum supported value is 101000 which was released in 2016-09 (see
+feature_matrix.py).
 
-Default value: 140100
+Default value: 150000
 
 .. _min_chrome_version:
 
@@ -2923,7 +2910,8 @@ This setting also applies to modern Chromium-based Edge, which shares version
 numbers with Chrome.
 Chrome 85 was released on 2020-08-25.
 MAX_INT (0x7FFFFFFF, or -1) specifies that target is not supported.
-Minimum supported value is 32, which was released on 2014-01-04.
+Minimum supported value is 45, which was released on 2015-09-01 (see
+feature_matrix.py).
 
 Default value: 85
 
@@ -2936,21 +2924,10 @@ Specifies minimum node version to target for the generated code.  This is
 distinct from the minimum version required run the emscripten compiler.
 This version aligns with the current Ubuuntu TLS 20.04 (Focal).
 Version is encoded in MMmmVV, e.g. 181401 denotes Node 18.14.01.
-Minimum supported value is 101900, which was released 2020-02-05.
+Minimum supported value is 101900, which was released 2020-02-05 (see
+feature_matrix.py).
 
 Default value: 160000
-
-.. _support_errno:
-
-SUPPORT_ERRNO
-=============
-
-Whether we support setting errno from JS library code.
-In MINIMAL_RUNTIME builds, this option defaults to 0.
-
-.. note:: This setting is deprecated
-
-Default value: true
 
 .. _minimal_runtime:
 
@@ -3087,6 +3064,8 @@ normal wasm or that wasm2js code. For details of how to do that, see the
 test_maybe_wasm2js test.  This option can be useful for debugging and
 bisecting.
 
+.. note:: This setting is deprecated
+
 Default value: false
 
 .. _asan_shadow_size:
@@ -3121,6 +3100,21 @@ Whether we should load the WASM source map at runtime.
 This is enabled automatically when using -gsource-map with sanitizers.
 
 Default value: false
+
+.. _source_map_prefixes:
+
+SOURCE_MAP_PREFIXES
+===================
+
+List of path substitutions to apply in the "sources" field of the source map.
+Corresponds to the ``--prefix`` option used in ``tools/wasm-sourcemap.py``.
+Must be used with ``-gsource-map``.
+
+This setting allows to map path prefixes to the proper ones so that the final
+(possibly relative) URLs point to the correct locations :
+``-sSOURCE_MAP_PREFIXES=/old/path=/new/path``
+
+Default value: []
 
 .. _default_to_cxx:
 
@@ -3339,3 +3333,25 @@ Use _ for non-pointer arguments, p for pointer/i53 arguments, and P for optional
 Example use -sSIGNATURE_CONVERSIONS=someFunction:_p,anotherFunction:p
 
 Default value: []
+
+.. _source_phase_imports:
+
+SOURCE_PHASE_IMPORTS
+====================
+
+Experimental support for wasm source phase imports.
+This is only currently implemented in the pre-release/nightly version of node,
+and not yet supported by browsers.
+Requires EXPORT_ES6
+
+Default value: false
+
+.. _wasm_esm_integration:
+
+WASM_ESM_INTEGRATION
+====================
+
+Experimental support for wasm ESM integration.
+Requires EXPORT_ES6 and MODULARIZE=instance
+
+Default value: false

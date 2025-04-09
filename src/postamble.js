@@ -24,29 +24,23 @@ if (ENVIRONMENT_IS_WORKER) {
 #include "deterministic.js"
 #endif
 
-{{{ exportRuntime() }}}
-
+#if ASSERTIONS
 var calledRun;
+#endif
 
 #if STANDALONE_WASM && MAIN_READS_PARAMS
 var mainArgs = undefined;
 #endif
 
-dependenciesFulfilled = function runCaller() {
-  // If run has never been called, and we should call run (INVOKE_RUN is true, and Module.noInitialRun is not false)
-  if (!calledRun) run();
-  if (!calledRun) dependenciesFulfilled = runCaller; // try this again later, after new deps are fulfilled
-};
-
 #if HAS_MAIN
 #if MAIN_READS_PARAMS
-function callMain(args = []) {
+{{{ asyncIf(ASYNCIFY == 2) }}}function callMain(args = []) {
 #else
-function callMain() {
+{{{ asyncIf(ASYNCIFY == 2) }}}function callMain() {
 #endif
 #if ASSERTIONS
   assert(runDependencies == 0, 'cannot call main when async dependencies remain! (listen on Module["onRuntimeInitialized"])');
-  assert(__ATPRERUN__.length == 0, 'cannot call main when preRun functions remain to be called');
+  assert(typeof onPreRuns === 'undefined' || onPreRuns.length == 0, 'cannot call main when preRun functions remain to be called');
 #endif
 
   var entryFunction = {{{ getEntryFunction() }}};
@@ -100,18 +94,12 @@ function callMain() {
     // The current spec of JSPI returns a promise only if the function suspends
     // and a plain value otherwise. This will likely change:
     // https://github.com/WebAssembly/js-promise-integration/issues/11
-    Promise.resolve(ret).then((result) => {
-      exitJS(result, /* implicit = */ true);
-    }).catch((e) => {
-      handleException(e);
-    });
-#else
+    ret = await ret;
+#endif // ASYNCIFY == 2
     // if we're not running an evented main loop, it's time to exit
     exitJS(ret, /* implicit = */ true);
-#endif // ASYNCIFY == 2
     return ret;
-  }
-  catch (e) {
+  } catch (e) {
     return handleException(e);
   }
 #if ABORT_ON_WASM_EXCEPTIONS
@@ -142,12 +130,6 @@ function stackCheckInit() {
 }
 #endif
 
-#if MAIN_MODULE && PTHREADS
-// Map of modules to be shared with new threads.  This gets populated by the
-// main thread and shared with all new workers via the initial `load` message.
-var sharedModules = {};
-#endif
-
 #if MAIN_READS_PARAMS
 function run(args = arguments_) {
 #else
@@ -158,28 +140,16 @@ function run() {
 #if RUNTIME_DEBUG
     dbg('run() called, but dependencies remain, so not running');
 #endif
+    dependenciesFulfilled = run;
     return;
   }
 
-#if WASM_WORKERS
-  if (ENVIRONMENT_IS_WASM_WORKER) {
+#if PTHREADS || WASM_WORKERS
+  if ({{{ ENVIRONMENT_IS_WORKER_THREAD() }}}) {
 #if MODULARIZE
     readyPromiseResolve(Module);
-#endif // MODULARIZE
-    return initRuntime();
-  }
 #endif
-
-#if PTHREADS
-  if (ENVIRONMENT_IS_PTHREAD) {
-#if MODULARIZE
-    // The promise resolve function typically gets called as part of the execution
-    // of `doRun` below. The workers/pthreads don't execute `doRun` so the
-    // creation promise can be resolved, marking the pthread-Module as initialized.
-    readyPromiseResolve(Module);
-#endif // MODULARIZE
     initRuntime();
-    startWorker(Module);
     return;
   }
 #endif
@@ -195,14 +165,17 @@ function run() {
 #if RUNTIME_DEBUG
     dbg('run() called, but dependencies remain, so not running');
 #endif
+    dependenciesFulfilled = run;
     return;
   }
 
   function doRun() {
     // run may have just been called through dependencies being fulfilled just in this very frame,
     // or while the async setStatus time below was happening
-    if (calledRun) return;
+#if ASSERTIONS
+    assert(!calledRun);
     calledRun = true;
+#endif
     Module['calledRun'] = true;
 
     if (ABORT) return;
@@ -218,13 +191,17 @@ function run() {
 #endif
 #if expectToReceiveOnModule('onRuntimeInitialized')
     Module['onRuntimeInitialized']?.();
+#if ASSERTIONS
+    consumedModuleProp('onRuntimeInitialized');
+#endif
 #endif
 
 #if HAS_MAIN
+    var noInitialRun = {{{ makeModuleReceiveExpr('noInitialRun', !INVOKE_RUN) }}};
 #if MAIN_READS_PARAMS
-    if (shouldRunNow) callMain(args);
+    if (!noInitialRun) callMain(args);
 #else
-    if (shouldRunNow) callMain();
+    if (!noInitialRun) callMain();
 #endif
 #else
 #if ASSERTIONS
@@ -308,30 +285,32 @@ function checkUnflushedContent() {
 #endif // EXIT_RUNTIME
 #endif // ASSERTIONS
 
+function preInit() {
 #if expectToReceiveOnModule('preInit')
-if (Module['preInit']) {
-  if (typeof Module['preInit'] == 'function') Module['preInit'] = [Module['preInit']];
-  while (Module['preInit'].length > 0) {
-    Module['preInit'].pop()();
+  if (Module['preInit']) {
+    if (typeof Module['preInit'] == 'function') Module['preInit'] = [Module['preInit']];
+    while (Module['preInit'].length > 0) {
+      Module['preInit'].shift()();
+    }
   }
+#if ASSERTIONS
+  consumedModuleProp('preInit');
+#endif
+#endif
 }
-#endif
 
-#if HAS_MAIN
-// shouldRunNow refers to calling main(), not run().
-#if INVOKE_RUN
-var shouldRunNow = true;
+#if WASM_ESM_INTEGRATION
+export default function init(moduleArg = {}) {
+  Module = moduleArg;
+  updateMemoryViews();
+  processModuleArgs();
+  preInit();
+  run();
+}
 #else
-var shouldRunNow = false;
-#endif
-
-#if expectToReceiveOnModule('noInitialRun')
-if (Module['noInitialRun']) shouldRunNow = false;
-#endif
-
-#endif // HAS_MAIN
-
+preInit();
 run();
+#endif
 
 #if BUILD_AS_WORKER
 

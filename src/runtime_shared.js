@@ -4,10 +4,41 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "runtime_stack_check.js"
+#include "runtime_exceptions.js"
+#include "runtime_debug.js"
+#include "memoryprofiler.js"
+
+#if SAFE_HEAP
+#include "runtime_safe_heap.js"
+#endif
+
+#if SHARED_MEMORY && ALLOW_MEMORY_GROWTH
+#include "growableHeap.js"
+#endif
+
+#if USE_ASAN
+#include "runtime_asan.js"
+#endif
+
+#if PTHREADS
+#include "runtime_pthread.js"
+#endif
+
+#if LOAD_SOURCE_MAP
+var wasmSourceMap;
+#include "source_map_support.js"
+#endif
+
+#if USE_OFFSET_CONVERTER
+var wasmOffsetConverter;
+#include "wasm_offset_converter.js"
+#endif
+
 {{{
   // Helper function to export a heap symbol on the module object,
   // if requested.
-  globalThis.maybeExportHeap = (x) => {
+  const maybeExportHeap = (x) => {
     // For now, we export all heap object when not building with MINIMAL_RUNTIME
     let shouldExport = !MINIMAL_RUNTIME && !STRICT;
     if (!shouldExport) {
@@ -22,17 +53,18 @@
         shouldExport = true;
       }
     }
-
-    return shouldExport ? `Module['${x}'] = ` : '';
+    if (shouldExport) {
+      if (MODULARIZE === 'instance' && !WASM_ESM_INTEGRATION) {
+        return `__exp_${x} = `
+      }
+      return `Module['${x}'] = `;
+    }
+    return '';
   };
-  null;
 }}}
 
 function updateMemoryViews() {
   var b = wasmMemory.buffer;
-#if SUPPORT_BIG_ENDIAN
-  {{{ maybeExportHeap('HEAP_DATA_VIEW') }}} HEAP_DATA_VIEW = new DataView(b);
-#endif
   {{{ maybeExportHeap('HEAP8')   }}}HEAP8 = new Int8Array(b);
   {{{ maybeExportHeap('HEAP16')  }}}HEAP16 = new Int16Array(b);
   {{{ maybeExportHeap('HEAPU8')  }}}HEAPU8 = new Uint8Array(b);
@@ -44,6 +76,10 @@ function updateMemoryViews() {
 #if WASM_BIGINT
   {{{ maybeExportHeap('HEAP64')  }}}HEAP64 = new BigInt64Array(b);
   {{{ maybeExportHeap('HEAPU64') }}}HEAPU64 = new BigUint64Array(b);
+#endif
+#if SUPPORT_BIG_ENDIAN
+  {{{ maybeExportHeap('HEAP_DATA_VIEW') }}} HEAP_DATA_VIEW = new DataView(b);
+  LE_HEAP_UPDATE();
 #endif
 }
 

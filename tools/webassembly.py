@@ -3,7 +3,7 @@
 # University of Illinois/NCSA Open Source License.  Both these licenses can be
 # found in the LICENSE file.
 
-"""Utilties for manipulating WebAssembly binaries from python.
+"""Utilities for manipulating WebAssembly binaries from python.
 """
 
 from collections import namedtuple
@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 
+from .utils import memoize
 from . import utils
 
 sys.path.append(utils.path_from_root('third_party'))
@@ -55,19 +56,6 @@ def read_sleb(iobuf):
   return leb128.i.decode_reader(iobuf)[0]
 
 
-def memoize(method):
-
-  @wraps(method)
-  def wrapper(self, *args, **kwargs):
-    assert not kwargs
-    key = (method.__name__, args)
-    if key not in self._cache:
-      self._cache[key] = method(self, *args, **kwargs)
-    return self._cache[key]
-
-  return wrapper
-
-
 def once(method):
 
   @wraps(method)
@@ -87,6 +75,7 @@ class Type(IntEnum):
   V128 = 0x7b # -0x5
   FUNCREF = 0x70 # -0x10
   EXTERNREF = 0x6f # -0x11
+  EXNREF = 0x69 # -0x17
   VOID = 0x40 # -0x40
 
 
@@ -160,6 +149,7 @@ class DylinkType(IntEnum):
   NEEDED = 2
   EXPORT_INFO = 3
   IMPORT_INFO = 4
+  RUNTIME_PATH = 5
 
 
 class TargetFeaturePrefix(IntEnum):
@@ -176,7 +166,7 @@ Limits = namedtuple('Limits', ['flags', 'initial', 'maximum'])
 Import = namedtuple('Import', ['kind', 'module', 'field', 'type'])
 Export = namedtuple('Export', ['name', 'kind', 'index'])
 Global = namedtuple('Global', ['type', 'mutable', 'init'])
-Dylink = namedtuple('Dylink', ['mem_size', 'mem_align', 'table_size', 'table_align', 'needed', 'export_info', 'import_info'])
+Dylink = namedtuple('Dylink', ['mem_size', 'mem_align', 'table_size', 'table_align', 'needed', 'export_info', 'import_info', 'runtime_paths'])
 Table = namedtuple('Table', ['elem_type', 'limits'])
 FunctionBody = namedtuple('FunctionBody', ['offset', 'size'])
 DataSegment = namedtuple('DataSegment', ['flags', 'init', 'offset', 'size'])
@@ -292,15 +282,11 @@ class Module:
       type_form = self.read_byte()
       assert type_form == 0x60
 
-      params = []
       num_params = self.read_uleb()
-      for _ in range(num_params):
-        params.append(self.read_type())
+      params = [self.read_type() for _ in range(num_params)]
 
-      returns = []
       num_returns = self.read_uleb()
-      for _ in range(num_returns):
-        returns.append(self.read_type())
+      returns = [self.read_type() for _ in range(num_returns)]
 
       types.append(FuncType(params, returns))
 
@@ -328,6 +314,7 @@ class Module:
     needed = []
     export_info = {}
     import_info = {}
+    runtime_paths = []
     self.read_string()  # name
 
     if dylink_section.name == 'dylink':
@@ -374,6 +361,12 @@ class Module:
             import_info.setdefault(module, {})
             import_info[module][field] = flags
             count -= 1
+        elif subsection_type == DylinkType.RUNTIME_PATH:
+          count = self.read_uleb()
+          while count:
+            rpath = self.read_string()
+            runtime_paths.append(rpath)
+            count -= 1
         else:
           print(f'unknown subsection: {subsection_type}')
           # ignore unknown subsections
@@ -382,7 +375,7 @@ class Module:
     else:
       utils.exit_with_error('error parsing shared library')
 
-    return Dylink(mem_size, mem_align, table_size, table_align, needed, export_info, import_info)
+    return Dylink(mem_size, mem_align, table_size, table_align, needed, export_info, import_info, runtime_paths)
 
   @memoize
   def get_exports(self):
@@ -524,10 +517,7 @@ class Module:
 
     self.seek(function_section.offset)
     num_types = self.read_uleb()
-    func_types = []
-    for _ in range(num_types):
-      func_types.append(self.read_uleb())
-    return func_types
+    return [self.read_uleb() for _ in range(num_types)]
 
   def has_name_section(self):
     return self.get_custom_section('name') is not None

@@ -106,7 +106,7 @@ When the event occurs the callback is invoked with the relevant event "type" (fo
 
 .. _callback-handler-return-em_bool-html5-api:
 
-Callback handlers that return an :c:data:`bool` may specify ``true`` to signal that the handler *consumed* the event (this suppresses the default action for that event by calling its ``.preventDefault();`` member). Returning ``false`` indicates that the event was not consumed — the default browser event action is carried out and the event is allowed to pass on/bubble up as normal.
+Callback handlers that return a ``bool`` may specify ``true`` to signal that the handler *consumed* the event (this suppresses the default action for that event by calling its ``.preventDefault();`` member). Returning ``false`` indicates that the event was not consumed — the default browser event action is carried out and the event is allowed to pass on/bubble up as normal.
 
 Calling a registration function with a ``null`` pointer for the callback causes a de-registration of that callback from the given ``target`` element. All event handlers are also automatically unregistered when the C ``exit()`` function is invoked during the ``atexit`` handler pass. Either use the function :c:func:`emscripten_set_main_loop` or set ``Module.noExitRuntime = true;`` to make sure that leaving ``main()`` will not immediately cause an ``exit()`` and clean up the event handlers.
 
@@ -800,7 +800,7 @@ Functions
 
   Returns the most recently received ``deviceorientation`` event state.
 
-  Note that for this function call to succeed, :c:func:`emscripten_set_deviceorientation_callback` must have first been called with one of the mouse event types and a non-zero callback function pointer to enable the ``deviceorientation`` state capture.
+  Note that for this function call to succeed, :c:func:`emscripten_set_deviceorientation_callback` must have first been called with a non-zero callback function pointer to enable the ``deviceorientation`` state capture.
 
   :param orientationState: The most recently received ``deviceorientation`` event state.
   :type orientationState: EmscriptenDeviceOrientationEvent*
@@ -892,7 +892,7 @@ Functions
 
   Returns the most recently received `devicemotion <http://w3c.github.io/deviceorientation/spec-source-orientation.html#devicemotion>`_ event state.
 
-  Note that for this function call to succeed, :c:func:`emscripten_set_devicemotion_callback` must have first been called with one of the mouse event types and a non-zero callback function pointer to enable the ``devicemotion`` state capture.
+  Note that for this function call to succeed, :c:func:`emscripten_set_devicemotion_callback` must have first been called with a non-zero callback function pointer to enable the ``devicemotion`` state capture.
 
   :param motionState: The most recently received ``devicemotion`` event state.
   :type motionState: EmscriptenDeviceMotionEvent*
@@ -2069,7 +2069,11 @@ Functions
   .. note::
 
     - A successful call to this function will not immediately make that rendering context active. Call :c:func:`emscripten_webgl_make_context_current` after creating a context to activate it.
-    - This function will try to initialize the context version that was *exactly* requested. It will not e.g. initialize a newer backwards-compatible version or similar.
+    - A word of caution about :c:type:`EmscriptenWebGLContextAttributes.majorVersion`:
+
+      - When no (WEBGL) linker flags are set, then this attribute is ignored and the context returned is WebGL 1.0
+      - When the linker flag ``-sMIN_WEBGL_VERSION=2`` is set, then this attribute is ignored and the context returned is WebGL 2.0
+      - When the linker flag ``-sMAX_WEBGL_VERSION=2`` is set, then this attribute is used and the context returned matches the value of this attribute
 
   :param target: The DOM canvas element in which to initialize the WebGL context.
   :type target: const char*

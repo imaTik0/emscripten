@@ -106,7 +106,7 @@ def check_js_engines():
   working_engines = [e for e in config.JS_ENGINES if jsrun.check_engine(e)]
   if len(working_engines) < len(config.JS_ENGINES):
     print('Not all the JS engines in JS_ENGINES appears to work.')
-    exit(1)
+    sys.exit(1)
 
   if common.EMTEST_ALL_ENGINES:
     print('(using ALL js engines)')
@@ -285,7 +285,7 @@ def load_test_suites(args, modules, start_at, repeat):
         unmatched_test_names.remove(name)
       except AttributeError:
         pass
-    if len(names_in_module):
+    if names_in_module:
       loaded_tests = loader.loadTestsFromNames(sorted(names_in_module), m)
       tests = flattened_tests(loaded_tests)
       suite = suite_for_module(m, tests)
@@ -311,8 +311,7 @@ def load_test_suites(args, modules, start_at, repeat):
 def flattened_tests(loaded_tests):
   tests = []
   for subsuite in loaded_tests:
-    for test in subsuite:
-      tests.append(test)
+    tests.extend(subsuite)
   return tests
 
 
@@ -330,8 +329,8 @@ def run_tests(options, suites):
   resultMessages = []
   num_failures = 0
 
-  print('Test suites:')
-  print([s[0] for s in suites])
+  if len(suites) > 1:
+    print('Test suites:', [s[0] for s in suites])
   # Run the discovered tests
 
   # We currently don't support xmlrunner on macOS M1 runner since
@@ -365,7 +364,7 @@ def run_tests(options, suites):
   return num_failures
 
 
-def parse_args(args):
+def parse_args():
   parser = argparse.ArgumentParser(prog='runner.py', description=__doc__)
   parser.add_argument('--save-dir', action='store_true',
                       help='Save the temporary directory used during for each '
@@ -413,8 +412,8 @@ def configure():
   parallel_testsuite.NUM_CORES = os.environ.get('EMTEST_CORES') or os.environ.get('EMCC_CORES')
 
 
-def main(args):
-  options = parse_args(args)
+def main():
+  options = parse_args()
 
   # Some options make sense being set in the environment, others not-so-much.
   # TODO(sbc): eventually just make these command-line only.
@@ -495,7 +494,7 @@ configure()
 
 if __name__ == '__main__':
   try:
-    sys.exit(main(sys.argv))
+    sys.exit(main())
   except KeyboardInterrupt:
     logger.warning('KeyboardInterrupt')
     sys.exit(1)

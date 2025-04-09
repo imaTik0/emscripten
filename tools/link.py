@@ -36,12 +36,10 @@ from . import extract_metadata
 from .utils import read_file, write_file, delete_file
 from .utils import removeprefix, exit_with_error
 from .shared import in_temp, safe_copy, do_replace, OFormat
-from .shared import DEBUG, WINDOWS, DYNAMICLIB_ENDINGS, STATICLIB_ENDINGS
+from .shared import DEBUG, WINDOWS, DYLIB_EXTENSIONS
 from .shared import unsuffixed, unsuffixed_basename, get_file_suffix
 from .settings import settings, default_setting, user_settings, JS_ONLY_SETTINGS, DEPRECATED_SETTINGS
 from .minimal_runtime_shell import generate_minimal_runtime_html
-
-import tools.line_endings
 
 logger = logging.getLogger('link')
 
@@ -56,14 +54,15 @@ DEFAULT_ASYNCIFY_EXPORTS = [
 
 VALID_ENVIRONMENTS = ('web', 'webview', 'worker', 'node', 'shell')
 
-EXECUTABLE_ENDINGS = ['.wasm', '.html', '.js', '.mjs', '.out', '']
+EXECUTABLE_EXTENSIONS = ['.wasm', '.html', '.js', '.mjs', '.out', '']
 
 # Supported LLD flags which we will pass through to the linker.
 SUPPORTED_LINKER_FLAGS = (
     '--start-group', '--end-group',
     '-(', '-)',
     '--whole-archive', '--no-whole-archive',
-    '-whole-archive', '-no-whole-archive'
+    '-whole-archive', '-no-whole-archive',
+    '-rpath',
 )
 
 # Unsupported LLD flags which we will ignore.
@@ -73,9 +72,7 @@ UNSUPPORTED_LLD_FLAGS = {
     '-bind_at_load': False,
     # wasm-ld doesn't support soname or other dynamic linking flags (yet).   Ignore them
     # in order to aid build systems that want to pass these flags.
-    '-soname': True,
     '-allow-shlib-undefined': False,
-    '-rpath': True,
     '-rpath-link': True,
     '-version-script': True,
     '-install_name': True,
@@ -166,7 +163,7 @@ def will_metadce():
 def setup_environment_settings():
   # Environment setting based on user input
   environments = settings.ENVIRONMENT.split(',')
-  if any([x for x in environments if x not in VALID_ENVIRONMENTS]):
+  if any(x for x in environments if x not in VALID_ENVIRONMENTS):
     exit_with_error(f'Invalid environment specified in "ENVIRONMENT": {settings.ENVIRONMENT}. Should be one of: {",".join(VALID_ENVIRONMENTS)}')
 
   settings.ENVIRONMENT_MAY_BE_WEB = not settings.ENVIRONMENT or 'web' in environments
@@ -191,15 +188,54 @@ def setup_environment_settings():
 
 
 def generate_js_sym_info():
-  # Runs the js compiler to generate a list of all symbols available in the JS
-  # libraries.  This must be done separately for each linker invocation since the
-  # list of symbols depends on what settings are used.
-  # TODO(sbc): Find a way to optimize this.  Potentially we could add a super-set
-  # mode of the js compiler that would generate a list of all possible symbols
-  # that could be checked in.
+  """Runs the js compiler to generate a list of all symbols available in the JS
+  libraries.  This must be done separately for each linker invocation since the
+  list of symbols depends on what settings are used.
+  TODO(sbc): Find a way to optimize this.  Potentially we could add a super-set
+  mode of the js compiler that would generate a list of all possible symbols
+  that could be checked in.
+  """
   _, forwarded_data = emscripten.compile_javascript(symbols_only=True)
   # When running in symbols_only mode compiler.mjs outputs a flat list of C symbols.
   return json.loads(forwarded_data)
+
+
+def get_cached_file(filetype, filename, generator, cache_limit):
+  """This function implements a file cache which lives inside the main
+  emscripten cache directory but uses a per-file lock rather than a
+  cache-wide lock.
+
+  The cache is pruned (by removing the oldest files) if it grows above
+  a certain number of files.
+  """
+  root = cache.get_path(filetype)
+  utils.safe_ensure_dirs(root)
+
+  cache_file = os.path.join(root, filename)
+
+  with filelock.FileLock(cache_file + '.lock'):
+    if os.path.exists(cache_file):
+      # Cache hit, read the file
+      file_content = read_file(cache_file)
+    else:
+      # Cache miss, generate the symbol list and write the file
+      file_content = generator()
+      write_file(cache_file, file_content)
+
+  if len([f for f in os.listdir(root) if not f.endswith('.lock')]) > cache_limit:
+    with filelock.FileLock(cache.get_path(f'{filetype}.lock')):
+      files = []
+      for f in os.listdir(root):
+        if not f.endswith('.lock'):
+          f = os.path.join(root, f)
+          files.append((f, os.path.getmtime(f)))
+      files.sort(key=lambda x: x[1])
+      # Delete all but the newest N files
+      for f, _ in files[:-cache_limit]:
+        with filelock.FileLock(f + '.lock'):
+          delete_file(f)
+
+  return file_content
 
 
 @ToolchainProfiler.profile_block('JS symbol generation')
@@ -216,45 +252,23 @@ def get_js_sym_info():
   # and can contain full paths to temporary files.
   skip_settings = {'PRE_JS_FILES', 'POST_JS_FILES'}
   input_files = [json.dumps(settings.external_dict(skip_keys=skip_settings), sort_keys=True, indent=2)]
-  for jslib in sorted(glob.glob(utils.path_from_root('src') + '/library*.js')):
-    input_files.append(read_file(jslib))
+  jslibs = glob.glob(utils.path_from_root('src/lib') + '/lib*.js')
+  assert jslibs
+  input_files.extend(read_file(jslib) for jslib in sorted(jslibs))
   for jslib in settings.JS_LIBRARIES:
-    if not os.path.isabs(jslib):
-      jslib = utils.path_from_root('src', jslib)
     input_files.append(read_file(jslib))
   content = '\n'.join(input_files)
   content_hash = hashlib.sha1(content.encode('utf-8')).hexdigest()
 
-  def build_symbol_list(filename):
-    """Only called when there is no existing symbol list for a given content hash.
-    """
+  def generate_json():
     library_syms = generate_js_sym_info()
+    return json.dumps(library_syms, separators=(',', ':'), indent=2)
 
-    write_file(filename, json.dumps(library_syms, separators=(',', ':'), indent=2))
-
-  # We need to use a separate lock here for symbol lists because, unlike with system libraries,
-  # it's normally for these file to get pruned as part of normal operation.  This means that it
-  # can be deleted between the `cache.get()` then the `read_file`.
-  with filelock.FileLock(cache.get_path(cache.get_path('symbol_lists.lock'))):
-    filename = cache.get(f'symbol_lists/{content_hash}.json', build_symbol_list)
-    library_syms = json.loads(read_file(filename))
-
-    # Limit of the overall size of the cache to 100 files.
-    # This code will get test coverage since a full test run of `other` or `core`
-    # generates ~1000 unique symbol lists.
-    cache_limit = 500
-    root = cache.get_path('symbol_lists')
-    if len(os.listdir(root)) > cache_limit:
-      files = []
-      for f in os.listdir(root):
-        f = os.path.join(root, f)
-        files.append((f, os.path.getmtime(f)))
-      files.sort(key=lambda x: x[1])
-      # Delete all but the newest N files
-      for f, _ in files[:-cache_limit]:
-        delete_file(f)
-
-  return library_syms
+  # Limit of the overall size of the cache.
+  # This code will get test coverage since a full test run of `other` or `core`
+  # generates ~1000 unique symbol lists.
+  file_content = get_cached_file('symbol_lists', f'{content_hash}.json', generate_json, cache_limit=500)
+  return json.loads(file_content)
 
 
 def filter_link_flags(flags, using_lld):
@@ -262,7 +276,7 @@ def filter_link_flags(flags, using_lld):
     if using_lld:
       for flag, takes_arg in UNSUPPORTED_LLD_FLAGS.items():
         # lld allows various flags to have either a single -foo or double --foo
-        if f.startswith(flag) or f.startswith('-' + flag):
+        if f.startswith((flag, '-' + flag)):
           diagnostics.warning('linkflags', 'ignoring unsupported linker flag: `%s`', f)
           # Skip the next argument if this linker flag takes and argument and that
           # argument was not specified as a separately (i.e. it was specified as
@@ -271,11 +285,11 @@ def filter_link_flags(flags, using_lld):
           return False, skip_next
       return True, False
     else:
-      if f in SUPPORTED_LINKER_FLAGS:
+      if not f.startswith('-') or f in SUPPORTED_LINKER_FLAGS:
         return True, False
       # Silently ignore -l/-L flags when not using lld.  If using lld allow
       # them to pass through the linker
-      if f.startswith('-l') or f.startswith('-L'):
+      if f.startswith(('-l', '-L')):
         return False, False
       diagnostics.warning('linkflags', 'ignoring unsupported linker flag: `%s`', f)
       return False, False
@@ -286,7 +300,7 @@ def filter_link_flags(flags, using_lld):
     if skip_next:
       skip_next = False
       continue
-    keep, skip_next = is_supported(f[1])
+    keep, skip_next = is_supported(f)
     if keep:
       results.append(f)
 
@@ -305,7 +319,7 @@ def read_js_files(files):
   for f in files:
     content = read_file(f)
     if content.startswith('#preprocess\n'):
-      contents.append(shared.read_and_preprocess(f, expand_macros=True))
+      contents.append(building.read_and_preprocess(f, expand_macros=True))
     else:
       contents.append(content)
   contents = '\n'.join(contents)
@@ -340,6 +354,13 @@ def get_binaryen_passes():
   if not feature_matrix.caniuse(feature_matrix.Feature.SIGN_EXT):
     logger.debug('lowering sign-ext feature due to incompatible target browser engines')
     passes += ['--signext-lowering']
+  # nontrapping-fp is enabled by default in llvm. Lower it away if requested.
+  if not feature_matrix.caniuse(feature_matrix.Feature.NON_TRAPPING_FPTOINT):
+    logger.debug('lowering nontrapping-fp feature due to incompatible target browser engines')
+    passes += ['--llvm-nontrapping-fptoint-lowering']
+  if not feature_matrix.caniuse(feature_matrix.Feature.BULK_MEMORY):
+    logger.debug('lowering bulk-memory feature due to incompatible target browser engines')
+    passes += ['--llvm-memory-copy-fill-lowering']
   if optimizing:
     passes += ['--post-emscripten']
     if settings.SIDE_MODULE:
@@ -425,10 +446,6 @@ def get_binaryen_passes():
     extras = settings.BINARYEN_EXTRA_PASSES.split(',')
     passes += [('--' + p) if p[0] != '-' else p for p in extras if p]
 
-  # Run the translator to the new EH instructions with exnref
-  if settings.WASM_EXNREF:
-    passes += ['--emit-exnref']
-
   # If we are going to run metadce then that means we will be running binaryen
   # tools after the main invocation, whose flags are determined here
   # (specifically we will run metadce and possibly also wasm-opt for import/
@@ -446,9 +463,7 @@ def get_binaryen_passes():
 def make_js_executable(script):
   src = read_file(script)
   cmd = config.NODE_JS
-  if settings.MEMORY64 == 1:
-    cmd += shared.node_memory64_flags()
-  elif settings.WASM_BIGINT:
+  if settings.WASM_BIGINT:
     cmd += shared.node_bigint_flags(config.NODE_JS)
   if len(cmd) > 1 or not os.path.isabs(cmd[0]):
     # Using -S (--split-string) here means that arguments to the executable are
@@ -499,10 +514,6 @@ def setup_pthreads():
   settings.REQUIRED_EXPORTS += [
     '_emscripten_thread_free_data',
     '_emscripten_thread_crashed',
-    'emscripten_main_runtime_thread_id',
-    'emscripten_main_thread_process_queued_calls',
-    '_emscripten_run_on_main_thread_js',
-    'emscripten_stack_set_limits',
   ]
 
   if settings.EMBIND:
@@ -590,7 +601,7 @@ def set_max_memory():
     if initial_memory_known:
       settings.MAXIMUM_MEMORY = settings.INITIAL_MEMORY
 
-  # Automaticaly up the default maximum when the user requested a large minimum.
+  # Automatically up the default maximum when the user requested a large minimum.
   if 'MAXIMUM_MEMORY' not in user_settings:
     if settings.ALLOW_MEMORY_GROWTH:
       if any([settings.INITIAL_HEAP != -1 and settings.INITIAL_HEAP >= 2 * 1024 * 1024 * 1024,
@@ -626,7 +637,7 @@ def check_browser_versions():
 
   if settings.LEGACY_VM_SUPPORT:
     # Default all browser versions to zero
-    for key in min_version_settings.keys():
+    for key in min_version_settings:
       default_setting(key, 0)
 
   for key, oldest in min_version_settings.items():
@@ -634,10 +645,25 @@ def check_browser_versions():
       exit_with_error(f'{key} older than {oldest} is not supported')
 
 
+def add_system_js_lib(lib):
+  lib = utils.path_from_root('src/lib', lib)
+  assert os.path.exists(lib)
+  settings.JS_LIBRARIES.append(lib)
+
+
 @ToolchainProfiler.profile_block('linker_setup')
-def phase_linker_setup(options, state, newargs):
-  system_libpath = '-L' + str(cache.get_lib_dir(absolute=True))
-  state.append_link_flag(system_libpath)
+def phase_linker_setup(options, linker_args):  # noqa: C901, PLR0912, PLR0915
+  """Future modifications should consider refactoring to reduce complexity.
+
+  * The McCabe cyclomatiic complexity is currently 251 vs 10 recommended.
+  * There are currently 262 branches vs 12 recommended.
+  * There are currently 578 statements vs 50 recommended.
+
+  To revalidate these numbers, run `ruff check --select=C901,PLR091`.
+  """
+
+  apply_library_settings(linker_args)
+  linker_args += calc_extra_ldflags(options)
 
   # We used to do this check during on startup during `check_sanity`, but
   # we now only do it when linking, in order to reduce the overhead when
@@ -645,7 +671,7 @@ def phase_linker_setup(options, state, newargs):
   if not shared.SKIP_SUBPROCS:
     shared.check_llvm_version()
 
-  autoconf = os.environ.get('EMMAKEN_JUST_CONFIGURE') or 'conftest.c' in state.orig_args or 'conftest.cpp' in state.orig_args
+  autoconf = os.environ.get('EMMAKEN_JUST_CONFIGURE') or 'conftest.c' in options.input_files or 'conftest.cpp' in options.input_files
   if autoconf:
     # configure tests want a more shell-like style, where we emit return codes on exit()
     settings.EXIT_RUNTIME = 1
@@ -660,14 +686,20 @@ def phase_linker_setup(options, state, newargs):
   if options.emrun:
     options.pre_js.append(utils.path_from_root('src/emrun_prejs.js'))
     options.post_js.append(utils.path_from_root('src/emrun_postjs.js'))
+    if settings.MINIMAL_RUNTIME:
+      exit_with_error('--emrun is not compatible with MINIMAL_RUNTIME')
     # emrun mode waits on program exit
+    if user_settings.get('EXIT_RUNTIME') == '0':
+      exit_with_error('--emrun is not compatible with EXIT_RUNTIME=0')
     settings.EXIT_RUNTIME = 1
+    # emrun_postjs.js needs this library function.
+    settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE += ['$addOnExit']
 
   if options.cpu_profiler:
     options.post_js.append(utils.path_from_root('src/cpuprofiler.js'))
 
   # Unless RUNTIME_DEBUG is explicitly set then we enable it when any of the
-  # more specfic debug settings are present.
+  # more specific debug settings are present.
   default_setting('RUNTIME_DEBUG', int(settings.LIBRARY_DEBUG or
                                        settings.GL_DEBUG or
                                        settings.DYLINK_DEBUG or
@@ -687,9 +719,9 @@ def phase_linker_setup(options, state, newargs):
     if not settings.ASSERTIONS:
       exit_with_error('PTHREADS_PROFILING only works with ASSERTIONS enabled')
     options.post_js.append(utils.path_from_root('src/threadprofiler.js'))
-
-  options.extern_pre_js = read_js_files(options.extern_pre_js)
-  options.extern_post_js = read_js_files(options.extern_post_js)
+    settings.REQUIRED_EXPORTS.append('emscripten_main_runtime_thread_id')
+    # threadprofiler.js needs these library functions.
+    settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE += ['$addOnInit', '$addOnExit']
 
   # TODO: support source maps with js_transform
   if options.js_transform and settings.GENERATE_SOURCE_MAP:
@@ -720,9 +752,6 @@ def phase_linker_setup(options, state, newargs):
     if s in user_settings:
       diagnostics.warning('deprecated', f'{s} is deprecated ({reason}). Please open a bug if you have a continuing need for this setting')
 
-  if settings.EXTRA_EXPORTED_RUNTIME_METHODS:
-    settings.EXPORTED_RUNTIME_METHODS += settings.EXTRA_EXPORTED_RUNTIME_METHODS
-
   # If no output format was specified we try to deduce the format based on
   # the output filename extension
   if not options.oformat and (options.relocatable or (options.shared and not settings.SIDE_MODULE)):
@@ -730,7 +759,7 @@ def phase_linker_setup(options, state, newargs):
     # we support a compatibility mode where shared libraries are actually just
     # object files linked with `wasm-ld --relocatable` or `llvm-link` in the case
     # of LTO.
-    if final_suffix in EXECUTABLE_ENDINGS:
+    if final_suffix in EXECUTABLE_EXTENSIONS:
       diagnostics.warning('emcc', '-shared/-r used with executable output suffix. This behaviour is deprecated.  Please remove -shared/-r to build an executable or avoid the executable suffix (%s) when building object files.' % final_suffix)
     else:
       if options.shared:
@@ -753,8 +782,22 @@ def phase_linker_setup(options, state, newargs):
         diagnostics.warning('unused-command-line-argument', f'{s} is only valid when generating JavaScript output')
 
   if options.oformat == OFormat.MJS:
-    settings.EXPORT_ES6 = 1
-    settings.MODULARIZE = 1
+    default_setting('EXPORT_ES6', 1)
+
+  if settings.WASM_ESM_INTEGRATION:
+    diagnostics.warning('experimental', '-sWASM_ESM_INTEGRATION is still experimental and not yet supported in browsers')
+    default_setting('EXPORT_ES6', 1)
+    default_setting('MODULARIZE', 'instance')
+    if not settings.EXPORT_ES6 or settings.MODULARIZE != 'instance':
+      exit_with_error('WASM_ESM_INTEGRATION requires EXPORT_ES6 and MODULARIZE=instance')
+
+  if settings.MODULARIZE and settings.MODULARIZE not in [1, 'instance']:
+    exit_with_error(f'Invalid setting "{settings.MODULARIZE}" for MODULARIZE.')
+
+  if settings.MODULARIZE == 'instance':
+    diagnostics.warning('experimental', '-sMODULARIZE=instance is still experimental. Many features may not work or will change.')
+    if options.oformat != OFormat.MJS:
+      exit_with_error('emcc: MODULARIZE instance is only compatible with .mjs output files')
 
   if options.oformat in (OFormat.WASM, OFormat.BARE):
     if options.emit_tsd:
@@ -778,9 +821,19 @@ def phase_linker_setup(options, state, newargs):
     # to js.
     settings.WASM = 1
     settings.WASM2JS = 1
+
   if settings.WASM == 2:
     # Requesting both Wasm and Wasm2JS support
     settings.WASM2JS = 1
+
+  if settings.WASM2JS:
+    settings.MAYBE_WASM2JS = 1
+    # Wasm bigint doesn't make sense with wasm2js, since it controls how the
+    # wasm and JS interact.
+    if user_settings.get('WASM_BIGINT') and settings.WASM_BIGINT:
+      exit_with_error('WASM_BIGINT=1 is not compatible with wasm2js')
+    settings.WASM_BIGINT = 0
+    feature_matrix.disable_feature(feature_matrix.Feature.JS_BIGINT_INTEGRATION)
 
   if options.oformat == OFormat.WASM and not settings.SIDE_MODULE:
     # if the output is just a wasm file, it will normally be a standalone one,
@@ -869,7 +922,7 @@ def phase_linker_setup(options, state, newargs):
     # PURE_WASI, or when we are linking without standard libraries because
     # STACK_OVERFLOW_CHECK depends on emscripten_stack_get_end which is defined
     # in libcompiler-rt.
-    if not settings.PURE_WASI and '-nostdlib' not in newargs and '-nodefaultlibs' not in newargs:
+    if not settings.PURE_WASI and not options.nostdlib and not options.nodefaultlibs:
       default_setting('STACK_OVERFLOW_CHECK', max(settings.ASSERTIONS, settings.STACK_OVERFLOW_CHECK))
 
   # For users that opt out of WARN_ON_UNDEFINED_SYMBOLS we assume they also
@@ -885,6 +938,12 @@ def phase_linker_setup(options, state, newargs):
     # When using MINIMAL_RUNTIME, symbols should only be exported if requested.
     default_setting('EXPORT_KEEPALIVE', 0)
 
+  if settings.EXPORT_ES6 and not settings.MODULARIZE:
+    # EXPORT_ES6 requires output to be a module
+    if 'MODULARIZE' in user_settings:
+      exit_with_error('EXPORT_ES6 requires MODULARIZE to be set')
+    settings.MODULARIZE = 1
+
   if settings.STRICT_JS and (settings.MODULARIZE or settings.EXPORT_ES6):
     exit_with_error("STRICT_JS doesn't work with MODULARIZE or EXPORT_ES6")
 
@@ -896,7 +955,7 @@ def phase_linker_setup(options, state, newargs):
       options.shell_path = DEFAULT_SHELL_HTML
 
   if settings.STRICT:
-    if not settings.MODULARIZE and not settings.EXPORT_ES6:
+    if not settings.MODULARIZE:
       default_setting('STRICT_JS', 1)
     default_setting('DEFAULT_TO_CXX', 0)
     default_setting('IGNORE_MISSING_MAIN', 0)
@@ -920,12 +979,13 @@ def phase_linker_setup(options, state, newargs):
     settings.EXPORTED_RUNTIME_METHODS.extend([
       'HEAPF32',
       'HEAPF64',
-      'HEAP_DATA_VIEW',
       'HEAP8',  'HEAPU8',
       'HEAP16', 'HEAPU16',
       'HEAP32', 'HEAPU32',
       'HEAP64', 'HEAPU64',
     ])
+    if settings.SUPPORT_BIG_ENDIAN:
+      settings.EXPORTED_RUNTIME_METHODS.append('HEAP_DATA_VIEW')
 
   # Default to TEXTDECODER=2 (always use TextDecoder to decode UTF-8 strings)
   # in -Oz builds, since custom decoder for UTF-8 takes up space.
@@ -958,10 +1018,6 @@ def phase_linker_setup(options, state, newargs):
 
   if settings.MINIMAL_RUNTIME_STREAMING_WASM_COMPILATION and settings.MINIMAL_RUNTIME_STREAMING_WASM_INSTANTIATION:
     exit_with_error('MINIMAL_RUNTIME_STREAMING_WASM_COMPILATION and MINIMAL_RUNTIME_STREAMING_WASM_INSTANTIATION are mutually exclusive!')
-
-  if options.emrun:
-    if settings.MINIMAL_RUNTIME:
-      exit_with_error('--emrun is not compatible with MINIMAL_RUNTIME')
 
   if options.use_closure_compiler:
     settings.USE_CLOSURE_COMPILER = 1
@@ -1095,7 +1151,21 @@ def phase_linker_setup(options, state, newargs):
       '$LE_HEAP_LOAD_U32',
       '$LE_HEAP_LOAD_I32',
       '$LE_HEAP_LOAD_F32',
-      '$LE_HEAP_LOAD_F64'
+      '$LE_HEAP_LOAD_F64',
+      '$LE_ATOMICS_NATIVE_BYTE_ORDER',
+      '$LE_ATOMICS_ADD',
+      '$LE_ATOMICS_AND',
+      '$LE_ATOMICS_COMPAREEXCHANGE',
+      '$LE_ATOMICS_EXCHANGE',
+      '$LE_ATOMICS_ISLOCKFREE',
+      '$LE_ATOMICS_LOAD',
+      '$LE_ATOMICS_NOTIFY',
+      '$LE_ATOMICS_OR',
+      '$LE_ATOMICS_STORE',
+      '$LE_ATOMICS_SUB',
+      '$LE_ATOMICS_WAIT',
+      '$LE_ATOMICS_WAITASYNC',
+      '$LE_ATOMICS_XOR',
     ]
 
   if settings.RUNTIME_DEBUG or settings.ASSERTIONS or settings.STACK_OVERFLOW_CHECK or settings.PTHREADS_PROFILING or settings.GL_ASSERTIONS:
@@ -1130,9 +1200,6 @@ def phase_linker_setup(options, state, newargs):
     # creation.
     if settings.MINIMAL_RUNTIME and options.oformat == OFormat.HTML and not settings.PTHREADS:
       settings.USE_READY_PROMISE = 0
-
-  if settings.WASM2JS and settings.LEGACY_VM_SUPPORT:
-    settings.POLYFILL_OLD_MATH_FUNCTIONS = 1
 
   check_browser_versions()
 
@@ -1176,12 +1243,7 @@ def phase_linker_setup(options, state, newargs):
     diagnostics.warning('transpile', '-sEXCEPTION_STACK_TRACES requires an engine that support ES6 classes.')
     settings.EXCEPTION_STACK_TRACES = 0
 
-  # Silently drop any individual backwards compatibility emulation flags that are known never to occur on browsers that support WebAssembly.
-  if not settings.WASM2JS:
-    settings.POLYFILL_OLD_MATH_FUNCTIONS = 0
-
   if settings.STB_IMAGE:
-    state.append_link_flag('-lstb_image')
     settings.EXPORTED_FUNCTIONS += ['_stbi_load', '_stbi_load_from_memory', '_stbi_image_free']
 
   if settings.USE_WEBGL2:
@@ -1211,18 +1273,9 @@ def phase_linker_setup(options, state, newargs):
     exit_with_error('`-sFORCE_FILESYSTEM` cannot be used with `-sFILESYSTEM=0`')
 
   if settings.WASMFS:
-    if settings.NODERAWFS:
-      # wasmfs will be included normally in system_libs.py, but we must include
-      # noderawfs in a forced manner so that it is always linked in (the hook it
-      # implements can remain unimplemented, so it won't be linked in
-      # automatically)
-      # TODO: find a better way to do this
-      state.append_link_flag('--whole-archive')
-      state.append_link_flag('-lwasmfs_noderawfs')
-      state.append_link_flag('--no-whole-archive')
     settings.FILESYSTEM = 1
     settings.SYSCALLS_REQUIRE_FILESYSTEM = 0
-    settings.JS_LIBRARIES.append((0, 'library_wasmfs.js'))
+    add_system_js_lib('libwasmfs.js')
     if settings.ASSERTIONS:
       # used in assertion checks for unflushed content
       settings.REQUIRED_EXPORTS += ['wasmfs_flush']
@@ -1236,12 +1289,11 @@ def phase_linker_setup(options, state, newargs):
       settings.REQUIRED_EXPORTS += [
         'emscripten_builtin_memalign',
         'wasmfs_create_file',
+        'wasmfs_unmount',
         '_wasmfs_mount',
-        '_wasmfs_unmount',
         '_wasmfs_read_file',
         '_wasmfs_write_file',
         '_wasmfs_open',
-        '_wasmfs_allocate',
         '_wasmfs_close',
         '_wasmfs_write',
         '_wasmfs_pwrite',
@@ -1273,13 +1325,6 @@ def phase_linker_setup(options, state, newargs):
         '_wasmfs_readdir_finish',
         '_wasmfs_get_cwd',
       ]
-
-  if settings.FETCH:
-    state.append_link_flag('-lfetch')
-
-  if settings.DEMANGLE_SUPPORT:
-    settings.REQUIRED_EXPORTS += ['__cxa_demangle', 'free']
-    settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE += ['$demangle', '$stackTrace']
 
   if settings.FULL_ES3:
     settings.FULL_ES2 = 1
@@ -1331,9 +1376,6 @@ def phase_linker_setup(options, state, newargs):
     # overrides that.
     default_setting('ABORTING_MALLOC', 0)
 
-  if state.has_link_flag('-lembind'):
-    settings.EMBIND = 1
-
   if settings.EMBIND:
     # Workaround for embind+LTO issue:
     # https://github.com/emscripten-core/emscripten/issues/21653
@@ -1344,14 +1386,14 @@ def phase_linker_setup(options, state, newargs):
 
   if settings.PTHREADS:
     setup_pthreads()
-    settings.JS_LIBRARIES.append((0, 'library_pthread.js'))
+    add_system_js_lib('libpthread.js')
     if settings.PROXY_TO_PTHREAD:
       settings.PTHREAD_POOL_SIZE_STRICT = 0
       settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE += ['$runtimeKeepalivePush']
   else:
     if settings.PROXY_TO_PTHREAD:
       exit_with_error('-sPROXY_TO_PTHREAD requires -pthread to work!')
-    settings.JS_LIBRARIES.append((0, 'library_pthread_stub.js'))
+    add_system_js_lib('libpthread_stub.js')
 
   if settings.MEMORY64:
     # Any "pointers" passed to JS will now be i64's, in both modes.
@@ -1365,7 +1407,7 @@ def phase_linker_setup(options, state, newargs):
     # set location of Wasm Worker bootstrap JS file
     if settings.WASM_WORKERS == 1:
       settings.WASM_WORKER_FILE = unsuffixed(os.path.basename(target)) + '.ww.js'
-    settings.JS_LIBRARIES.append((0, 'library_wasm_worker.js'))
+    add_system_js_lib('libwasm_worker.js')
 
   # Set min browser versions based on certain settings such as WASM_BIGINT,
   # PTHREADS, AUDIO_WORKLET
@@ -1378,11 +1420,12 @@ def phase_linker_setup(options, state, newargs):
   settings.SUPPORTS_PROMISE_ANY = feature_matrix.caniuse(feature_matrix.Feature.PROMISE_ANY)
   if not settings.BULK_MEMORY:
     settings.BULK_MEMORY = feature_matrix.caniuse(feature_matrix.Feature.BULK_MEMORY)
+  default_setting('WASM_BIGINT', feature_matrix.caniuse(feature_matrix.Feature.JS_BIGINT_INTEGRATION))
 
   if settings.AUDIO_WORKLET:
     if settings.AUDIO_WORKLET == 1:
       settings.AUDIO_WORKLET_FILE = unsuffixed(os.path.basename(target)) + '.aw.js'
-    settings.JS_LIBRARIES.append((0, shared.path_from_root('src', 'library_webaudio.js')))
+    add_system_js_lib('libwebaudio.js')
     if not settings.MINIMAL_RUNTIME:
       # If we are in the audio worklet environment, we can only access the Module object
       # and not the global scope of the main JS script. Therefore we need to export
@@ -1390,6 +1433,14 @@ def phase_linker_setup(options, state, newargs):
       # MINIMAL_RUNTIME exports these manually, since this export mechanism is placed
       # in global scope that is not suitable for MINIMAL_RUNTIME loader.
       settings.EXPORTED_RUNTIME_METHODS += ['stackSave', 'stackAlloc', 'stackRestore', 'wasmTable']
+      # The following symbols need exposing to load and bootstrap the audio worklet:
+      settings.INCOMING_MODULE_JS_API += ['instantiateWasm', 'wasm', 'wasmMemory']
+
+  if not settings.MINIMAL_RUNTIME:
+    if 'preRun' in settings.INCOMING_MODULE_JS_API:
+      settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE.append('$addOnPreRun')
+    if 'postRun' in settings.INCOMING_MODULE_JS_API:
+      settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE.append('$addOnPostRun')
 
   if settings.FORCE_FILESYSTEM and not settings.MINIMAL_RUNTIME:
     # when the filesystem is forced, we export by default methods that filesystem usage
@@ -1419,17 +1470,11 @@ def phase_linker_setup(options, state, newargs):
 
   set_initial_memory()
 
-  if settings.EXPORT_ES6:
-    if not settings.MODULARIZE:
-      # EXPORT_ES6 requires output to be a module
-      if 'MODULARIZE' in user_settings:
-        exit_with_error('EXPORT_ES6 requires MODULARIZE to be set')
-      settings.MODULARIZE = 1
-    if shared.target_environment_may_be('node') and not settings.USE_ES6_IMPORT_META:
-      # EXPORT_ES6 + ENVIRONMENT=*node* requires the use of import.meta.url
-      if 'USE_ES6_IMPORT_META' in user_settings:
-        exit_with_error('EXPORT_ES6 and ENVIRONMENT=*node* requires USE_ES6_IMPORT_META to be set')
-      settings.USE_ES6_IMPORT_META = 1
+  if settings.EXPORT_ES6 and not settings.MODULARIZE:
+    # EXPORT_ES6 requires output to be a module
+    if 'MODULARIZE' in user_settings:
+      exit_with_error('EXPORT_ES6 requires MODULARIZE to be set')
+    settings.MODULARIZE = 1
 
   if settings.MODULARIZE and not settings.DECLARE_ASM_MODULE_EXPORTS:
     # When MODULARIZE option is used, currently requires declaring all module exports
@@ -1438,8 +1483,8 @@ def phase_linker_setup(options, state, newargs):
 
   # When not declaring wasm module exports in outer scope one by one, disable minifying
   # wasm module export names so that the names can be passed directly to the outer scope.
-  # Also, if using library_exports.js API, disable minification so that the feature can work.
-  if not settings.DECLARE_ASM_MODULE_EXPORTS or state.has_link_flag('-lexports.js'):
+  # Also, if using libexports.js API, disable minification so that the feature can work.
+  if not settings.DECLARE_ASM_MODULE_EXPORTS or '-lexports.js' in linker_args:
     settings.MINIFY_WASM_EXPORT_NAMES = 0
 
   # Enable minification of wasm imports and exports when appropriate, if we
@@ -1480,7 +1525,8 @@ def phase_linker_setup(options, state, newargs):
   if settings.WASM_BIGINT:
     settings.LEGALIZE_JS_FFI = 0
 
-  if settings.SINGLE_FILE:
+  if settings.SINGLE_FILE and settings.GENERATE_SOURCE_MAP:
+    diagnostics.warning('emcc', 'SINGLE_FILE disables source map support (which requires a .map file)')
     settings.GENERATE_SOURCE_MAP = 0
 
   if settings.EVAL_CTORS:
@@ -1497,9 +1543,6 @@ def phase_linker_setup(options, state, newargs):
   if options.use_closure_compiler == 2 and not settings.WASM2JS:
     exit_with_error('closure compiler mode 2 assumes the code is asm.js, so not meaningful for wasm')
 
-  if settings.WASM2JS:
-    settings.MAYBE_WASM2JS = 1
-
   if settings.AUTODEBUG:
     settings.REQUIRED_EXPORTS += ['_emscripten_tempret_set']
 
@@ -1513,15 +1556,7 @@ def phase_linker_setup(options, state, newargs):
   if settings.SIDE_MODULE and shared.suffix(target) == '.js':
     diagnostics.warning('emcc', 'output suffix .js requested, but wasm side modules are just wasm files; emitting only a .wasm, no .js')
 
-  sanitize = set()
-
-  for arg in newargs:
-    if arg.startswith('-fsanitize='):
-      sanitize.update(arg.split('=', 1)[1].split(','))
-    elif arg.startswith('-fno-sanitize='):
-      sanitize.difference_update(arg.split('=', 1)[1].split(','))
-
-  if sanitize:
+  if options.sanitize:
     settings.USE_OFFSET_CONVERTER = 1
     # These symbols are needed by `withBuiltinMalloc` which used to implement
     # the `__noleakcheck` attribute.  However this dependency is not yet represented in the JS
@@ -1537,7 +1572,7 @@ def phase_linker_setup(options, state, newargs):
       'emscripten_builtin_free',
     ]
 
-  if ('leak' in sanitize or 'address' in sanitize) and not settings.ALLOW_MEMORY_GROWTH:
+  if ('leak' in options.sanitize or 'address' in options.sanitize) and not settings.ALLOW_MEMORY_GROWTH:
     # Increase the minimum memory requirements to account for extra memory
     # that the sanitizers might need (in addition to the shadow memory
     # requirements handled below).
@@ -1553,17 +1588,17 @@ def phase_linker_setup(options, state, newargs):
       exit_with_error('wasm2js is not compatible with USE_OFFSET_CONVERTER (see #14630)')
     settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE.append('$UTF8ArrayToString')
 
-  if sanitize & UBSAN_SANITIZERS:
-    if '-fsanitize-minimal-runtime' in newargs:
+  if options.sanitize & UBSAN_SANITIZERS:
+    if options.sanitize_minimal_runtime:
       settings.UBSAN_RUNTIME = 1
     else:
       settings.UBSAN_RUNTIME = 2
 
-  if 'leak' in sanitize:
+  if 'leak' in options.sanitize:
     settings.USE_LSAN = 1
     default_setting('EXIT_RUNTIME', 1)
 
-  if 'address' in sanitize:
+  if 'address' in options.sanitize:
     settings.USE_ASAN = 1
     default_setting('EXIT_RUNTIME', 1)
     if not settings.UBSAN_RUNTIME:
@@ -1638,7 +1673,7 @@ def phase_linker_setup(options, state, newargs):
     # ASan and SAFE_HEAP check address 0 themselves
     settings.CHECK_NULL_WRITES = 0
 
-  if sanitize and settings.GENERATE_SOURCE_MAP:
+  if options.sanitize and settings.GENERATE_SOURCE_MAP:
     settings.LOAD_SOURCE_MAP = 1
 
   if 'GLOBAL_BASE' not in user_settings and not settings.SHRINK_LEVEL and not settings.OPT_LEVEL and not settings.USE_ASAN:
@@ -1649,7 +1684,7 @@ def phase_linker_setup(options, state, newargs):
     # (because stack overflows will trap rather than corrupting data).
     settings.STACK_FIRST = True
 
-  if state.has_link_flag('--stack-first'):
+  if '--stack-first' in linker_args:
     settings.STACK_FIRST = True
     if settings.USE_ASAN:
       exit_with_error('--stack-first is not compatible with asan')
@@ -1739,6 +1774,9 @@ def phase_linker_setup(options, state, newargs):
     if settings.ASYNCIFY == 2:
       diagnostics.warning('experimental', '-sASYNCIFY=2 (JSPI) is still experimental')
 
+  if settings.SOURCE_PHASE_IMPORTS:
+    diagnostics.warning('experimental', '-sSOURCE_PHASE_IMPORTS is still experimental and not yet supported in browsers')
+
   if settings.WASM2JS:
     if settings.GENERATE_SOURCE_MAP:
       exit_with_error('wasm2js does not support source maps yet (debug in wasm for now)')
@@ -1752,7 +1790,7 @@ def phase_linker_setup(options, state, newargs):
   if settings.NODE_CODE_CACHING:
     if settings.WASM_ASYNC_COMPILATION:
       exit_with_error('NODE_CODE_CACHING requires sync compilation (WASM_ASYNC_COMPILATION=0)')
-    if not shared.target_environment_may_be('node'):
+    if not settings.ENVIRONMENT_MAY_BE_NODE:
       exit_with_error('NODE_CODE_CACHING only works in node, but target environments do not include it')
     if settings.SINGLE_FILE:
       exit_with_error('NODE_CODE_CACHING saves a file on the side and is not compatible with SINGLE_FILE')
@@ -1760,16 +1798,18 @@ def phase_linker_setup(options, state, newargs):
   if not js_manipulation.isidentifier(settings.EXPORT_NAME):
     exit_with_error(f'EXPORT_NAME is not a valid JS identifier: `{settings.EXPORT_NAME}`')
 
-  if settings.EMSCRIPTEN_TRACING and settings.ALLOW_MEMORY_GROWTH:
-    settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE += ['emscripten_trace_report_memory_layout']
-    settings.REQUIRED_EXPORTS += ['emscripten_stack_get_current',
-                                  'emscripten_stack_get_base',
-                                  'emscripten_stack_get_end']
+  if settings.EMSCRIPTEN_TRACING:
+    add_system_js_lib('libtrace.js')
+    if settings.ALLOW_MEMORY_GROWTH:
+      settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE += ['emscripten_trace_report_memory_layout']
+      settings.REQUIRED_EXPORTS += ['emscripten_stack_get_current',
+                                    'emscripten_stack_get_base',
+                                    'emscripten_stack_get_end']
 
   settings.EMSCRIPTEN_VERSION = utils.EMSCRIPTEN_VERSION
   settings.SOURCE_MAP_BASE = options.source_map_base or ''
 
-  settings.LINK_AS_CXX = (shared.run_via_emxx or settings.DEFAULT_TO_CXX) and '-nostdlib++' not in newargs
+  settings.LINK_AS_CXX = (shared.run_via_emxx or settings.DEFAULT_TO_CXX) and not options.nostdlibxx
 
   # WASMFS itself is written in C++, and needs C++ standard libraries
   if settings.WASMFS:
@@ -1778,7 +1818,6 @@ def phase_linker_setup(options, state, newargs):
   # Some settings make no sense when not linking as C++
   if not settings.LINK_AS_CXX:
     cxx_only_settings = [
-      'DEMANGLE_SUPPORT',
       'EXCEPTION_DEBUG',
       'DISABLE_EXCEPTION_CATCHING',
       'EXCEPTION_CATCHING_ALLOWED',
@@ -1826,8 +1865,8 @@ def phase_linker_setup(options, state, newargs):
   if settings.PTHREADS:
     settings.REQUIRED_EXPORTS.append('_emscripten_tls_init')
 
-  settings.PRE_JS_FILES = [os.path.abspath(f) for f in options.pre_js]
-  settings.POST_JS_FILES = [os.path.abspath(f) for f in options.post_js]
+  settings.PRE_JS_FILES = options.pre_js
+  settings.POST_JS_FILES = options.post_js
 
   settings.MINIFY_WHITESPACE = settings.OPT_LEVEL >= 2 and settings.DEBUG_LEVEL == 0 and not options.no_minify
 
@@ -1844,19 +1883,19 @@ def phase_linker_setup(options, state, newargs):
 
 
 @ToolchainProfiler.profile_block('calculate system libraries')
-def phase_calculate_system_libraries(linker_arguments, newargs):
+def phase_calculate_system_libraries(options):
   extra_files_to_link = []
   # Link in ports and system libraries, if necessary
   if not settings.SIDE_MODULE:
     # Ports are always linked into the main module, never the side module.
     extra_files_to_link += ports.get_libs(settings)
-  extra_files_to_link += system_libs.calculate(newargs)
-  linker_arguments.extend(extra_files_to_link)
+  extra_files_to_link += system_libs.calculate(options)
+  return extra_files_to_link
 
 
 @ToolchainProfiler.profile_block('link')
-def phase_link(linker_arguments, wasm_target, js_syms):
-  logger.debug(f'linking: {linker_arguments}')
+def phase_link(linker_args, wasm_target, js_syms):
+  logger.debug(f'linking: {linker_args}')
 
   # Make a final pass over settings.EXPORTED_FUNCTIONS to remove any
   # duplication between functions added by the driver/libraries and function
@@ -1877,16 +1916,16 @@ def phase_link(linker_arguments, wasm_target, js_syms):
     # TODO(sbc): Remove this double execution of wasm-ld if we ever find a way to
     # distinguish EMSCRIPTEN_KEEPALIVE exports from `--export-dynamic` exports.
     settings.LINKABLE = False
-    building.link_lld(linker_arguments, wasm_target, external_symbols=js_syms)
+    building.link_lld(linker_args, wasm_target, external_symbols=js_syms)
     settings.LINKABLE = True
     rtn = extract_metadata.extract_metadata(wasm_target)
 
-  building.link_lld(linker_arguments, wasm_target, external_symbols=js_syms)
+  building.link_lld(linker_args, wasm_target, external_symbols=js_syms)
   return rtn
 
 
 @ToolchainProfiler.profile_block('post link')
-def phase_post_link(options, state, in_wasm, wasm_target, target, js_syms, base_metadata=None, linker_inputs=None):
+def phase_post_link(options, in_wasm, wasm_target, target, js_syms, base_metadata=None):
   global final_js
 
   target_basename = unsuffixed_basename(target)
@@ -1897,19 +1936,19 @@ def phase_post_link(options, state, in_wasm, wasm_target, target, js_syms, base_
   settings.TARGET_BASENAME = unsuffixed_basename(target)
 
   if options.oformat in (OFormat.JS, OFormat.MJS):
-    state.js_target = target
+    js_target = target
   else:
-    state.js_target = get_secondary_target(target, '.js')
+    js_target = get_secondary_target(target, '.js')
 
-  settings.TARGET_JS_NAME = os.path.basename(state.js_target)
+  settings.TARGET_JS_NAME = os.path.basename(js_target)
 
   metadata = phase_emscript(in_wasm, wasm_target, js_syms, base_metadata)
 
   if settings.EMBIND_AOT:
-    phase_embind_aot(wasm_target, js_syms, linker_inputs)
+    phase_embind_aot(options, wasm_target, js_syms)
 
   if options.emit_tsd:
-    phase_emit_tsd(options, wasm_target, state.js_target, js_syms, metadata, linker_inputs)
+    phase_emit_tsd(options, wasm_target, js_target, js_syms, metadata)
 
   if options.js_transform:
     phase_source_transforms(options)
@@ -1918,7 +1957,7 @@ def phase_post_link(options, state, in_wasm, wasm_target, target, js_syms, base_
 
   # If we are not emitting any JS then we are all done now
   if options.oformat != OFormat.WASM:
-    phase_final_emitting(options, state, target, wasm_target)
+    phase_final_emitting(options, target, js_target, wasm_target)
 
 
 @ToolchainProfiler.profile_block('emscript')
@@ -1926,9 +1965,11 @@ def phase_emscript(in_wasm, wasm_target, js_syms, base_metadata):
   # Emscripten
   logger.debug('emscript')
 
-  # No need to support base64 embeddeding in wasm2js mode since
+  # No need to support base64 embedding in wasm2js mode since
   # the module is already in JS format.
-  settings.SUPPORT_BASE64_EMBEDDING = settings.SINGLE_FILE and not settings.WASM2JS
+  if settings.SINGLE_FILE and not settings.WASM2JS:
+    settings.SUPPORT_BASE64_EMBEDDING = 1
+    settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE.append('$base64Decode')
 
   if shared.SKIP_SUBPROCS:
     return
@@ -1938,19 +1979,19 @@ def phase_emscript(in_wasm, wasm_target, js_syms, base_metadata):
   return metadata
 
 
-def run_embind_gen(wasm_target, js_syms, extra_settings, linker_inputs):
+def run_embind_gen(options, wasm_target, js_syms, extra_settings):
   # Save settings so they can be restored after TS generation.
   original_settings = settings.backup()
   settings.attrs.update(extra_settings)
+  settings.EMBIND_GEN_MODE = True
 
-  if settings.MAIN_MODULE and linker_inputs:
+  if settings.MAIN_MODULE:
     # Copy libraries to the temp directory so they can be used when running
     # in node.
-    for _i, linker_input in linker_inputs:
-      if building.is_wasm_dylib(linker_input):
-        safe_copy(linker_input, in_temp(''))
+    for f in options.input_files:
+      if building.is_wasm_dylib(f):
+        safe_copy(f, in_temp(''))
 
-  settings.EXPORTED_RUNTIME_METHODS = []
   # Ignore any options or settings that can conflict with running the TS
   # generation output.
   # Don't invoke the program's `main` function.
@@ -1979,11 +2020,11 @@ def run_embind_gen(wasm_target, js_syms, extra_settings, linker_inputs):
   setup_environment_settings()
   # Use a separate Wasm file so the JS does not need to be modified after emscripten.emscript.
   settings.SINGLE_FILE = False
-  # Embind may be included multiple times, de-duplicate the list first.
-  settings.JS_LIBRARIES = dedup_list(settings.JS_LIBRARIES)
   # Replace embind with the TypeScript generation version.
-  embind_index = settings.JS_LIBRARIES.index('embind/embind.js')
-  settings.JS_LIBRARIES[embind_index] = 'embind/embind_gen.js'
+  for i, lib in enumerate(settings.JS_LIBRARIES):
+    dirname, basename = os.path.split(lib)
+    if basename == 'libembind.js':
+      settings.JS_LIBRARIES[i] = os.path.join(dirname, 'libembind_gen.js')
   if settings.MEMORY64:
     settings.MIN_NODE_VERSION = 160000
   # Source maps haven't been generated yet and aren't needed to run embind_gen.
@@ -1995,11 +2036,10 @@ def run_embind_gen(wasm_target, js_syms, extra_settings, linker_inputs):
   # Build the flags needed by Node.js to properly run the output file.
   node_args = []
   if settings.MEMORY64:
-    node_args += shared.node_memory64_flags()
-    # Currently we don't have any engines that support table64 so we need
-    # to lower it in order to run the output.
-    # In the normal flow this happens later in `phase_binaryen`
-    building.run_wasm_opt(outfile_wasm, outfile_wasm, ['--table64-lowering'])
+    # The final version of the memory64 proposal is not yet implemented in any
+    # shipping version of node, so we need to lower it away in order to
+    # execute the binary at built time.
+    building.run_wasm_opt(outfile_wasm, outfile_wasm, ['--memory64-lowering', '--table64-lowering'])
   if settings.WASM_EXCEPTIONS:
     node_args += shared.node_exception_flags(config.NODE_JS)
   # Run the generated JS file with the proper flags to generate the TypeScript bindings.
@@ -2009,20 +2049,20 @@ def run_embind_gen(wasm_target, js_syms, extra_settings, linker_inputs):
 
 
 @ToolchainProfiler.profile_block('emit tsd')
-def phase_emit_tsd(options, wasm_target, js_target, js_syms, metadata, linker_inputs):
+def phase_emit_tsd(options, wasm_target, js_target, js_syms, metadata):
   logger.debug('emit tsd')
   filename = options.emit_tsd
   embind_tsd = ''
   if settings.EMBIND:
-    embind_tsd = run_embind_gen(wasm_target, js_syms, {'EMBIND_AOT': False}, linker_inputs)
+    embind_tsd = run_embind_gen(options, wasm_target, js_syms, {'EMBIND_AOT': False})
   all_tsd = emscripten.create_tsd(metadata, embind_tsd)
   out_file = os.path.join(os.path.dirname(js_target), filename)
   write_file(out_file, all_tsd)
 
 
 @ToolchainProfiler.profile_block('embind aot js')
-def phase_embind_aot(wasm_target, js_syms, linker_inputs):
-  out = run_embind_gen(wasm_target, js_syms, {}, linker_inputs)
+def phase_embind_aot(options, wasm_target, js_syms):
+  out = run_embind_gen(options, wasm_target, js_syms, {})
   if DEBUG:
     write_file(in_temp('embind_aot.js'), out)
   src = read_file(final_js)
@@ -2060,20 +2100,22 @@ def phase_source_transforms(options):
 # both main code and libraries.
 # See also: `preprocess` in parseTools.js.
 def fix_es6_import_statements(js_file):
-  if not settings.EXPORT_ES6 or not settings.USE_ES6_IMPORT_META:
+  if not settings.MODULARIZE:
     return
 
   src = read_file(js_file)
   write_file(js_file, src
              .replace('EMSCRIPTEN$IMPORT$META', 'import.meta')
-             .replace('EMSCRIPTEN$AWAIT$IMPORT', 'await import'))
+             .replace('EMSCRIPTEN$AWAIT$IMPORT', 'await import')
+             .replace('EMSCRIPTEN$AWAIT(createWasm())', 'await createWasm()')
+             .replace('EMSCRIPTEN$AWAIT(', 'await ('))
   save_intermediate('es6-module')
 
 
 def create_worker_file(input_file, target_dir, output_file, options):
   output_file = os.path.join(target_dir, output_file)
   input_file = utils.path_from_root(input_file)
-  contents = shared.read_and_preprocess(input_file, expand_macros=True)
+  contents = building.read_and_preprocess(input_file, expand_macros=True)
   write_file(output_file, contents)
 
   fix_es6_import_statements(output_file)
@@ -2083,11 +2125,52 @@ def create_worker_file(input_file, target_dir, output_file, options):
     contents = building.acorn_optimizer(output_file, ['--minify-whitespace'], return_output=True, worker_js=True)
     write_file(output_file, contents)
 
-  tools.line_endings.convert_line_endings_in_file(output_file, os.linesep, options.output_eol)
+  utils.convert_line_endings_in_file(output_file, options.output_eol)
+
+
+def create_esm_wrapper(wrapper_file, support_target, wasm_target):
+  wasm_exports = []
+  js_exports = list(settings.EXPORTED_RUNTIME_METHODS)
+  for f in settings.USER_EXPORTS:
+    if f == '_main' and '__main_argc_argv' in settings.WASM_EXPORTS:
+      wasm_exports.append('__main_argc_argv as main')
+    elif f in settings.WASM_EXPORTS:
+      wasm_exports.append(shared.demangle_c_symbol_name(f))
+    else:
+      js_exports.append(f)
+  wasm_exports = ', '.join(wasm_exports)
+  js_exports = ', '.join(js_exports)
+
+  wrapper = []
+  if wasm_exports:
+    wrapper.append(f"export {{ {wasm_exports} }} from './{settings.WASM_BINARY_FILE}';")
+    # Because of the wasm ESM integration worker we need to make sure we import
+    # the wasm module here, before we import the support.js file.
+    # So, if there are no other exports we at least export the `memory`.
+  else:
+    wrapper.append('// The wasm module must be imported here first before the support file')
+    wrapper.append('// in order to avoid issues with circullr dependencies.')
+    wrapper.append(f"import * as unused from './{settings.WASM_BINARY_FILE}';")
+  support_url = f'./{os.path.basename(support_target)}'
+  if js_exports:
+    wrapper.append(f"export {{ default, {js_exports} }} from '{support_url}';")
+  else:
+    wrapper.append(f"export {{ default }} from '{support_url}';")
+  write_file(wrapper_file, '\n'.join(wrapper) + '\n')
+
+  # FIXME(sbc): This is a huge hack to rename the imports in the
+  # wasm file.  Find a better way to do this.
+  wasm_dis = os.path.join(building.get_binaryen_bin(), 'wasm-dis')
+  mod = shared.check_call([wasm_dis, wasm_target], stdout=PIPE).stdout
+  mod = mod.replace('(import "env"', f'(import "{support_url}"')
+  mod = mod.replace('(import "wasi_snapshot_preview1"', f'(import "{support_url}"')
+
+  wasm_as = os.path.join(building.get_binaryen_bin(), 'wasm-as')
+  shared.check_call([wasm_as, '--all-features', '-o', wasm_target, '-'], input=mod)
 
 
 @ToolchainProfiler.profile_block('final emitting')
-def phase_final_emitting(options, state, target, wasm_target):
+def phase_final_emitting(options, target, js_target, wasm_target):
   global final_js
 
   if shared.SKIP_SUBPROCS:
@@ -2103,7 +2186,7 @@ def phase_final_emitting(options, state, target, wasm_target):
   if settings.AUDIO_WORKLET == 1:
     create_worker_file('src/audio_worklet.js', target_dir, settings.AUDIO_WORKLET_FILE, options)
 
-  if settings.MODULARIZE:
+  if settings.MODULARIZE and not settings.WASM_ESM_INTEGRATION:
     modularize()
   elif settings.USE_CLOSURE_COMPILER:
     module_export_name_substitution()
@@ -2130,21 +2213,26 @@ def phase_final_emitting(options, state, target, wasm_target):
 
   # Apply pre and postjs files
   if options.extern_pre_js or options.extern_post_js:
+    extern_pre_js = read_js_files(options.extern_pre_js)
+    extern_post_js = read_js_files(options.extern_post_js)
     logger.debug('applying extern pre/postjses')
     src = read_file(final_js)
     final_js += '.epp.js'
     with open(final_js, 'w', encoding='utf-8') as f:
-      f.write(options.extern_pre_js)
+      f.write(extern_pre_js)
       f.write(src)
-      f.write(options.extern_post_js)
+      f.write(extern_post_js)
     save_intermediate('extern-pre-post')
 
   js_manipulation.handle_license(final_js)
 
-  js_target = state.js_target
-
   # The JS is now final. Move it to its final location
-  move_file(final_js, js_target)
+  if settings.WASM_ESM_INTEGRATION:
+    support_target = unsuffixed(js_target) + '.support.mjs'
+    move_file(final_js, support_target)
+    create_esm_wrapper(js_target, support_target, wasm_target)
+  else:
+    move_file(final_js, js_target)
 
   target_basename = unsuffixed_basename(target)
 
@@ -2153,14 +2241,14 @@ def phase_final_emitting(options, state, target, wasm_target):
     generate_html(target, options, js_target, target_basename,
                   wasm_target)
   elif settings.PROXY_TO_WORKER:
-    generate_worker_js(target, js_target, target_basename)
+    generate_worker_js(target, options, js_target, target_basename)
 
   if settings.SPLIT_MODULE:
     diagnostics.warning('experimental', 'the SPLIT_MODULE setting is experimental and subject to change')
     do_split_module(wasm_target, options)
 
   if not settings.SINGLE_FILE:
-    tools.line_endings.convert_line_endings_in_file(js_target, os.linesep, options.output_eol)
+    utils.convert_line_endings_in_file(js_target, options.output_eol)
 
   if options.executable:
     make_js_executable(js_target)
@@ -2279,7 +2367,7 @@ def phase_binaryen(target, options, wasm_target):
     if settings.WASM == 2:
       # With normal wasm2js mode this file gets included as part of the
       # preamble, but with WASM=2 its a separate file.
-      wasm2js_polyfill = shared.read_and_preprocess(utils.path_from_root('src/wasm2js.js'), expand_macros=True)
+      wasm2js_polyfill = building.read_and_preprocess(utils.path_from_root('src/wasm2js.js'), expand_macros=True)
       wasm2js_template = wasm_target + '.js'
       write_file(wasm2js_template, wasm2js_polyfill)
       # generate secondary file for JS symbols
@@ -2343,27 +2431,9 @@ def phase_binaryen(target, options, wasm_target):
   if final_js and settings.SINGLE_FILE and not settings.WASM2JS:
     js = read_file(final_js)
 
-    if settings.MINIMAL_RUNTIME:
-      js = do_replace(js, '<<< WASM_BINARY_DATA >>>', base64_encode(wasm_target))
-    else:
-      js = do_replace(js, '<<< WASM_BINARY_FILE >>>', get_subresource_location(wasm_target))
+    js = do_replace(js, '<<< WASM_BINARY_DATA >>>', base64_encode(wasm_target))
     delete_file(wasm_target)
     write_file(final_js, js)
-
-
-def node_es6_imports():
-  if not settings.EXPORT_ES6 or not shared.target_environment_may_be('node'):
-    return ''
-
-  # Multi-environment builds uses `await import` in `shell.js`
-  if shared.target_environment_may_be('web'):
-    return ''
-
-  # Use static import declaration if we only target Node.js
-  return '''
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-'''
 
 
 def node_pthread_detection():
@@ -2378,36 +2448,46 @@ def node_pthread_detection():
 def modularize():
   global final_js
   logger.debug(f'Modularizing, assigning to var {settings.EXPORT_NAME}')
-  src = read_file(final_js)
+  generated_js = read_file(final_js)
 
-  # Multi-environment ES6 builds require an async function
-  async_emit = ''
-  if settings.EXPORT_ES6 and \
-     shared.target_environment_may_be('node') and \
-     shared.target_environment_may_be('web'):
-    async_emit = 'async '
+  # When targetting node and ES6 we use `await import ..` in the generated code
+  # so the outer function needs to be marked as async.
+  if settings.WASM_ASYNC_COMPILATION or (settings.EXPORT_ES6 and settings.ENVIRONMENT_MAY_BE_NODE):
+    maybe_async = 'async '
+  else:
+    maybe_async = ''
 
-  # TODO: Remove when https://bugs.webkit.org/show_bug.cgi?id=223533 is resolved.
-  if async_emit != '' and settings.EXPORT_NAME == 'config':
-    diagnostics.warning('emcc', 'EXPORT_NAME should not be named "config" when targeting Safari')
-
-  src = '''
-%(maybe_async)sfunction(moduleArg = {}) {
+  if settings.MODULARIZE == 'instance':
+    wrapper_function = '''
+export default %(maybe_async)s function init(moduleArg = {}) {
   var moduleRtn;
 
-%(src)s
+%(generated_js)s
 
   return moduleRtn;
 }
 ''' % {
-    'maybe_async': async_emit,
-    'src': src,
-  }
+      'generated_js': generated_js,
+      'maybe_async': maybe_async,
+    }
+  else:
+    wrapper_function = '''
+%(maybe_async)sfunction(moduleArg = {}) {
+  var moduleRtn;
+
+%(generated_js)s
+
+  return moduleRtn;
+}
+''' % {
+      'maybe_async': maybe_async,
+      'generated_js': generated_js
+    }
 
   if settings.MINIMAL_RUNTIME and not settings.PTHREADS:
     # Single threaded MINIMAL_RUNTIME programs do not need access to
     # document.currentScript, so a simple export declaration is enough.
-    src = '/** @nocollapse */ var %s = %s' % (settings.EXPORT_NAME, src)
+    src = f'var {settings.EXPORT_NAME} = {wrapper_function};'
   else:
     script_url_node = ''
     # When MODULARIZE this JS may be executed later,
@@ -2415,25 +2495,38 @@ def modularize():
     # In EXPORT_ES6 + PTHREADS the 'thread' is actually an ES6 module
     # webworker running in strict mode, so doesn't have access to 'document'.
     # In this case use 'import.meta' instead.
-    if settings.EXPORT_ES6 and settings.USE_ES6_IMPORT_META:
+    if settings.EXPORT_ES6:
       script_url = 'import.meta.url'
     else:
       script_url = "typeof document != 'undefined' ? document.currentScript?.src : undefined"
-      if shared.target_environment_may_be('node'):
+      if settings.ENVIRONMENT_MAY_BE_NODE:
         script_url_node = "if (typeof __filename != 'undefined') _scriptName = _scriptName || __filename;"
-    src = '''%(node_imports)s
+    if settings.MODULARIZE == 'instance':
+      src = '''\
+  var _scriptName = %(script_url)s;
+  %(script_url_node)s
+  %(wrapper_function)s
+''' % {
+        'script_url': script_url,
+        'script_url_node': script_url_node,
+        'wrapper_function': wrapper_function,
+      }
+    else:
+      src = '''\
 var %(EXPORT_NAME)s = (() => {
   var _scriptName = %(script_url)s;
   %(script_url_node)s
-  return (%(src)s);
+  return (%(wrapper_function)s);
 })();
 ''' % {
-      'node_imports': node_es6_imports(),
-      'EXPORT_NAME': settings.EXPORT_NAME,
-      'script_url': script_url,
-      'script_url_node': script_url_node,
-      'src': src,
-    }
+        'EXPORT_NAME': settings.EXPORT_NAME,
+        'script_url': script_url,
+        'script_url_node': script_url_node,
+        'wrapper_function': wrapper_function,
+      }
+
+  if settings.SOURCE_PHASE_IMPORTS:
+    src = f"import source wasmModule from './{settings.WASM_BINARY_FILE}';\n\n" + src
 
   # Given the async nature of how the Module function and Module object
   # come into existence in AudioWorkletGlobalScope, store the Module
@@ -2446,13 +2539,24 @@ var %(EXPORT_NAME)s = (() => {
 
   # Export using a UMD style export, or ES6 exports if selected
   if settings.EXPORT_ES6:
-    src += 'export default %s;\n' % settings.EXPORT_NAME
-
+    if settings.MODULARIZE == 'instance':
+      exports = settings.EXPORTED_FUNCTIONS + settings.EXPORTED_RUNTIME_METHODS
+      # Declare a top level var for each export so that code in the init function
+      # can assign to it and update the live module bindings.
+      src += 'var ' + ', '.join(['__exp_' + export for export in exports]) + ';\n'
+      # Export the functions with their original name.
+      exports = ['__exp_' + export + ' as ' + export for export in exports]
+      src += 'export {' + ', '.join(exports) + '};\n'
+    else:
+      src += 'export default %s;\n' % settings.EXPORT_NAME
   elif not settings.MINIMAL_RUNTIME:
     src += '''\
-if (typeof exports === 'object' && typeof module === 'object')
+if (typeof exports === 'object' && typeof module === 'object') {
   module.exports = %(EXPORT_NAME)s;
-else if (typeof define === 'function' && define['amd'])
+  // This default export looks redundant, but it allows TS to import this
+  // commonjs style module.
+  module.exports.default = %(EXPORT_NAME)s;
+} else if (typeof define === 'function' && define['amd'])
   define([], () => %(EXPORT_NAME)s);
 ''' % {'EXPORT_NAME': settings.EXPORT_NAME}
 
@@ -2470,7 +2574,10 @@ else if (typeof define === 'function' && define['amd'])
     elif settings.ENVIRONMENT_MAY_BE_NODE:
       src += f'var isPthread = {node_pthread_detection()}\n'
     src += '// When running as a pthread, construct a new instance on startup\n'
-    src += 'isPthread && %s();\n' % settings.EXPORT_NAME
+    if settings.MODULARIZE == 'instance':
+      src += 'isPthread && init();\n'
+    else:
+      src += 'isPthread && %s();\n' % settings.EXPORT_NAME
 
   final_js += '.modular.js'
   write_file(final_js, src)
@@ -2506,37 +2613,14 @@ def generate_traditional_runtime_html(target, options, js_target, target_basenam
     # name, but the normal one does not support that currently
     exit_with_error('customizing EXPORT_NAME requires that the HTML be customized to use that name (see https://github.com/emscripten-core/emscripten/issues/10086)')
 
-  shell = shared.read_and_preprocess(options.shell_path)
+  shell = building.read_and_preprocess(options.shell_path)
   if '{{{ SCRIPT }}}' not in shell:
     exit_with_error('HTML shell must contain {{{ SCRIPT }}}, see src/shell.html for an example')
   base_js_target = os.path.basename(js_target)
 
   if settings.PROXY_TO_WORKER:
     proxy_worker_filename = (settings.PROXY_TO_WORKER_FILENAME or target_basename) + '.js'
-    worker_js = worker_js_script(proxy_worker_filename)
-    script.inline = ('''
-  var filename = '%s';
-  if ((',' + window.location.search.substr(1) + ',').indexOf(',noProxy,') < 0) {
-    console.log('running code in a web worker');
-''' % get_subresource_location_js(proxy_worker_filename)) + worker_js + '''
-  } else {
-    console.log('running code on the main thread');
-    var fileBytes = tryParseAsDataURI(filename);
-    var script = document.createElement('script');
-    if (fileBytes) {
-      script.innerHTML = intArrayToString(fileBytes);
-    } else {
-      script.src = filename;
-    }
-    document.body.appendChild(script);
-  }
-'''
-    # add required helper functions such as tryParseAsDataURI
-    for filename in ('arrayUtils.js', 'base64Utils.js', 'URIUtils.js'):
-      content = shared.read_and_preprocess(utils.path_from_root('src', filename))
-      script.inline = content + script.inline
-
-    script.inline = 'var ASSERTIONS = %s;\n%s' % (settings.ASSERTIONS, script.inline)
+    script.inline = worker_js_script(proxy_worker_filename)
   else:
     # Normal code generation path
     script.src = base_js_target
@@ -2656,10 +2740,10 @@ def generate_html(target, options, js_target, target_basename, wasm_target):
   if settings.MINIFY_HTML and (settings.OPT_LEVEL >= 1 or settings.SHRINK_LEVEL >= 1):
     minify_html(target)
 
-  tools.line_endings.convert_line_endings_in_file(target, os.linesep, options.output_eol)
+  utils.convert_line_endings_in_file(target, options.output_eol)
 
 
-def generate_worker_js(target, js_target, target_basename):
+def generate_worker_js(target, options, js_target, target_basename):
   if settings.SINGLE_FILE:
     # compiler output is embedded as base64 data URL
     proxy_worker_filename = get_subresource_location_js(js_target)
@@ -2670,12 +2754,12 @@ def generate_worker_js(target, js_target, target_basename):
     proxy_worker_filename = (settings.PROXY_TO_WORKER_FILENAME or worker_target_basename) + '.js'
 
   target_contents = worker_js_script(proxy_worker_filename)
-  write_file(target, target_contents)
+  utils.write_file(target, target_contents, options.output_eol)
 
 
 def worker_js_script(proxy_worker_filename):
   web_gl_client_src = read_file(utils.path_from_root('src/webGLClient.js'))
-  proxy_client_src = shared.read_and_preprocess(utils.path_from_root('src/proxyClient.js'), expand_macros=True)
+  proxy_client_src = building.read_and_preprocess(utils.path_from_root('src/proxyClient.js'), expand_macros=True)
   if not settings.SINGLE_FILE and not os.path.dirname(proxy_worker_filename):
     proxy_worker_filename = './' + proxy_worker_filename
   proxy_client_src = do_replace(proxy_client_src, '<<< filename >>>', proxy_worker_filename)
@@ -2701,23 +2785,23 @@ def map_to_js_libs(library_name):
   """
   # Some native libraries are implemented in Emscripten as system side JS libraries
   library_map = {
-    'embind': ['embind/embind.js', 'embind/emval.js'],
-    'EGL': ['library_egl.js'],
-    'GL': ['library_webgl.js', 'library_html5_webgl.js'],
-    'webgl.js': ['library_webgl.js', 'library_html5_webgl.js'],
-    'GLESv2': ['library_webgl.js'],
+    'embind': ['libembind.js', 'libemval.js'],
+    'EGL': ['libegl.js'],
+    'GL': ['libwebgl.js', 'libhtml5_webgl.js'],
+    'webgl.js': ['libwebgl.js', 'libhtml5_webgl.js'],
+    'GLESv2': ['libwebgl.js'],
     # N.b. there is no GLESv3 to link to (note [f] in https://www.khronos.org/registry/implementers_guide.html)
-    'GLEW': ['library_glew.js'],
-    'glfw': ['library_glfw.js'],
-    'glfw3': ['library_glfw.js'],
+    'GLEW': ['libglew.js'],
+    'glfw': ['libglfw.js'],
+    'glfw3': ['libglfw.js'],
     'GLU': [],
-    'glut': ['library_glut.js'],
-    'openal': ['library_openal.js'],
-    'X11': ['library_xlib.js'],
-    'SDL': ['library_sdl.js'],
-    'uuid': ['library_uuid.js'],
-    'fetch': ['library_fetch.js'],
-    'websocket': ['library_websocket.js'],
+    'glut': ['libglut.js'],
+    'openal': ['libopenal.js'],
+    'X11': ['libxlib.js'],
+    'SDL': ['libsdl.js'],
+    'uuid': ['libuuid.js'],
+    'fetch': ['libfetch.js'],
+    'websocket': ['libwebsocket.js'],
     # These 4 libraries are separate under glibc but are all rolled into
     # libc with musl.  For compatibility with glibc we just ignore them
     # completely.
@@ -2730,38 +2814,27 @@ def map_to_js_libs(library_name):
     'stdc++': [],
     'SDL2_mixer': [],
   }
-  settings_map = {
-    'glfw': {'USE_GLFW': 2},
-    'glfw3': {'USE_GLFW': 3},
-    'SDL': {'USE_SDL': 1},
-    'SDL2_mixer': {'USE_SDL_MIXER': 2},
-  }
-
-  if library_name in settings_map:
-    for key, value in settings_map[library_name].items():
-      default_setting(key, value)
 
   if library_name in library_map:
     libs = library_map[library_name]
     logger.debug('Mapping library `%s` to JS libraries: %s' % (library_name, libs))
     return libs
 
-  if library_name.endswith('.js') and os.path.isfile(utils.path_from_root('src', f'library_{library_name}')):
-    return [f'library_{library_name}']
-
   return None
 
 
-def process_libraries(state, linker_inputs):
+def process_libraries(options, flags):
   new_flags = []
-  libraries = []
-  suffixes = STATICLIB_ENDINGS + DYNAMICLIB_ENDINGS
   system_libs_map = system_libs.Library.get_usable_variations()
 
-  # Find library files
-  for i, flag in state.link_flags:
+  # Process `-l` and `--js-library` flags
+  for flag in flags:
+    if flag.startswith('--js-library='):
+      js_lib = flag.split('=', 1)[1]
+      settings.JS_LIBRARIES.append(js_lib)
+      continue
     if not flag.startswith('-l'):
-      new_flags.append((i, flag))
+      new_flags.append(flag)
       continue
     lib = removeprefix(flag, '-l')
 
@@ -2769,39 +2842,68 @@ def process_libraries(state, linker_inputs):
 
     js_libs = map_to_js_libs(lib)
     if js_libs is not None:
-      libraries += [(i, js_lib) for js_lib in js_libs]
+      for l in js_libs:
+        add_system_js_lib(l)
 
     # We don't need to resolve system libraries to absolute paths here, we can just
     # let wasm-ld handle that.  However, we do want to map to the correct variant.
     # For example we map `-lc` to `-lc-mt` if we are building with threading support.
     if 'lib' + lib in system_libs_map:
       lib = system_libs_map['lib' + lib].get_link_flag()
-      new_flags.append((i, lib))
+      new_flags.append(lib)
       continue
 
     if js_libs is not None:
       continue
 
-    path = None
-    for suff in suffixes:
-      name = 'lib' + lib + suff
-      path = find_library(name, state.lib_dirs)
-      if path:
-        break
-
-    if path:
-      linker_inputs.append((i, path))
+    if lib.endswith('.js'):
+      name = 'lib' + lib
+      path = find_library(name, options.lib_dirs)
+      if not path:
+        exit_with_error(f'unable to find library {flag}')
+      settings.JS_LIBRARIES.append(os.path.abspath(path))
       continue
 
-    new_flags.append((i, flag))
+    static_lib = f'lib{lib}.a'
+    if not settings.RELOCATABLE and not find_library(static_lib, options.lib_dirs):
+      # Normally we can rely on the native linker to expand `-l` args.
+      # However, emscripten also supports `.so` files that are actually just
+      # regular object file.  This means we need to support `.so` files even
+      # when statically linking.  The native linker (wasm-ld) will otherwise
+      # ignore .so files in this mode.
+      found_dylib = False
+      for ext in DYLIB_EXTENSIONS:
+        name = 'lib' + lib + ext
+        path = find_library(name, options.lib_dirs)
+        if path:
+          found_dylib = True
+          new_flags.append(path)
+          break
 
-  settings.JS_LIBRARIES += libraries
+      if found_dylib:
+        continue
 
-  # At this point processing JS_LIBRARIES is finished, no more items will be added to it.
-  # Sort the input list from (order, lib_name) pairs to a flat array in the right order.
-  settings.JS_LIBRARIES.sort(key=lambda lib: lib[0])
-  settings.JS_LIBRARIES = [lib[1] for lib in settings.JS_LIBRARIES]
-  state.link_flags = new_flags
+    new_flags.append(flag)
+
+  return new_flags
+
+
+def apply_library_settings(linker_args):
+  for arg in linker_args:
+    if not arg.startswith('-l'):
+      continue
+    library_name = arg[2:]
+    settings_map = {
+      'embind': {'EMBIND': 1},
+      'glfw': {'USE_GLFW': 2},
+      'glfw3': {'USE_GLFW': 3},
+      'SDL': {'USE_SDL': 1},
+      'SDL2_mixer': {'USE_SDL_MIXER': 2},
+    }
+
+    if library_name in settings_map:
+      for key, value in settings_map[library_name].items():
+        default_setting(key, value)
 
 
 class ScriptSource:
@@ -2849,17 +2951,17 @@ class ScriptSource:
       return '<script>\n%s\n</script>' % self.inline
 
 
-def filter_out_dynamic_libs(options, inputs):
+def filter_out_fake_dynamic_libs(options, inputs):
   # Filters out "fake" dynamic libraries that are really just intermediate object files.
-  def check(input_file):
-    if get_file_suffix(input_file) in DYNAMICLIB_ENDINGS and not building.is_wasm_dylib(input_file):
+  def is_fake_dylib(input_file):
+    if get_file_suffix(input_file) in DYLIB_EXTENSIONS and os.path.exists(input_file) and not building.is_wasm_dylib(input_file):
       if not options.ignore_dynamic_linking:
-        diagnostics.warning('emcc', 'ignoring dynamic library %s because not compiling to JS or HTML, remember to link it when compiling to JS or HTML at the end', os.path.basename(input_file))
-      return False
-    else:
+        diagnostics.warning('emcc', 'ignoring dynamic library %s when generating an object file, this will need to be included explicitly in the final link', os.path.basename(input_file))
       return True
+    else:
+      return False
 
-  return [f for f in inputs if check(f)]
+  return [f for f in inputs if not is_fake_dylib(f)]
 
 
 def filter_out_duplicate_dynamic_libs(inputs):
@@ -2868,7 +2970,7 @@ def filter_out_duplicate_dynamic_libs(inputs):
   # Filter out duplicate "fake" shared libraries (intermediate object files).
   # See test_core.py:test_redundant_link
   def check(input_file):
-    if get_file_suffix(input_file) in DYNAMICLIB_ENDINGS and not building.is_wasm_dylib(input_file):
+    if get_file_suffix(input_file) in DYLIB_EXTENSIONS and not building.is_wasm_dylib(input_file):
       abspath = os.path.abspath(input_file)
       if abspath in seen:
         return False
@@ -2899,7 +3001,7 @@ def process_dynamic_libs(dylibs, lib_dirs):
   dylibs += extras
   for dylib in dylibs:
     exports = webassembly.get_exports(dylib)
-    exports = set(e.name for e in exports)
+    exports = {e.name for e in exports}
     # EM_JS function are exports with a special prefix.  We need to strip
     # this prefix to get the actual symbol name.  For the main module, this
     # is handled by extract_metadata.py.
@@ -2913,7 +3015,7 @@ def process_dynamic_libs(dylibs, lib_dirs):
     # TODO(sbc): Integrate with metadata.invoke_funcs that comes from the
     # main module to avoid creating new invoke functions at runtime.
     imports = set(imports)
-    imports = set(i for i in imports if not i.startswith('invoke_'))
+    imports = {i for i in imports if not i.startswith('invoke_')}
     weak_imports = webassembly.get_weak_imports(dylib)
     strong_imports = sorted(imports.difference(weak_imports))
     logger.debug('Adding symbols requirements from `%s`: %s', dylib, imports)
@@ -3029,66 +3131,87 @@ def package_files(options, target):
 
 
 @ToolchainProfiler.profile_block('calculate linker inputs')
-def phase_calculate_linker_inputs(options, state, linker_inputs):
+def phase_calculate_linker_inputs(options, linker_args):
   using_lld = not (options.oformat == OFormat.OBJECT and settings.LTO)
-  state.link_flags = filter_link_flags(state.link_flags, using_lld)
 
-  # Decide what we will link
-  process_libraries(state, linker_inputs)
-
-  # Interleave the linker inputs with the linker flags while maintainging their
-  # relative order on the command line (both of these list are pairs, with the
-  # first element being their command line position).
-  linker_args = [val for _, val in sorted(linker_inputs + state.link_flags)]
+  linker_args = filter_link_flags(linker_args, using_lld)
 
   # If we are linking to an intermediate object then ignore other
   # "fake" dynamic libraries, since otherwise we will end up with
   # multiple copies in the final executable.
   if options.oformat == OFormat.OBJECT or options.ignore_dynamic_linking:
-    linker_args = filter_out_dynamic_libs(options, linker_args)
+    linker_args = filter_out_fake_dynamic_libs(options, linker_args)
   else:
     linker_args = filter_out_duplicate_dynamic_libs(linker_args)
 
   if settings.MAIN_MODULE:
     dylibs = [a for a in linker_args if building.is_wasm_dylib(a)]
-    process_dynamic_libs(dylibs, state.lib_dirs)
+    process_dynamic_libs(dylibs, options.lib_dirs)
 
   return linker_args
 
 
-def run_post_link(wasm_input, options, state, newargs):
+def calc_extra_ldflags(options):
+  extra_args = []
+  system_libpath = str(cache.get_lib_dir(absolute=True))
+  system_js_path = utils.path_from_root('src', 'lib')
+  options.lib_dirs.append(system_libpath)
+  options.lib_dirs.append(system_js_path)
+  extra_args.append('-L' + system_libpath)
+  extra_args.append('-L' + system_js_path)
+
+  if settings.FETCH:
+    extra_args.append('-lfetch')
+  if settings.STB_IMAGE:
+    extra_args.append('-lstb_image')
+  if settings.WASMFS and settings.NODERAWFS:
+    # wasmfs will be included normally in system_libs.py, but we must include
+    # noderawfs in a forced manner so that it is always linked in (the hook it
+    # implements can remain unimplemented, so it won't be linked in
+    # automatically)
+    # TODO: find a better way to do this
+    extra_args.append('--whole-archive')
+    extra_args.append('-lwasmfs_noderawfs')
+    extra_args.append('--no-whole-archive')
+
+  return extra_args
+
+
+def run_post_link(wasm_input, options, linker_args):
   settings.limit_settings(None)
-  target, wasm_target = phase_linker_setup(options, state, newargs)
-  process_libraries(state, [])
-  phase_post_link(options, state, wasm_input, wasm_target, target, {})
+  target, wasm_target = phase_linker_setup(options, linker_args)
+  process_libraries(options, linker_args)
+  phase_post_link(options, wasm_input, wasm_target, target, {})
 
 
-def run(linker_inputs, options, state, newargs):
+def run(options, linker_args):
   # We have now passed the compile phase, allow reading/writing of all settings.
   settings.limit_settings(None)
 
-  if not linker_inputs and not state.link_flags:
+  if not linker_args:
     exit_with_error('no input files')
 
   if options.output_file and options.output_file.startswith('-'):
     exit_with_error(f'invalid output filename: `{options.output_file}`')
 
-  target, wasm_target = phase_linker_setup(options, state, newargs)
+  target, wasm_target = phase_linker_setup(options, linker_args)
+
+  linker_args = process_libraries(options, linker_args)
 
   # Link object files using wasm-ld or llvm-link (for bitcode linking)
-  linker_arguments = phase_calculate_linker_inputs(options, state, linker_inputs)
+  linker_args = phase_calculate_linker_inputs(options, linker_args)
 
   # Embed and preload files
   if len(options.preload_files) or len(options.embed_files):
-    linker_arguments += package_files(options, target)
+    linker_args += package_files(options, target)
 
   if options.oformat == OFormat.OBJECT:
-    logger.debug(f'link_to_object: {linker_arguments} -> {target}')
-    building.link_to_object(linker_arguments, target)
+    logger.debug(f'link_to_object: {linker_args} -> {target}')
+    building.link_to_object(linker_args, target)
     logger.debug('stopping after linking to object file')
     return 0
 
-  phase_calculate_system_libraries(linker_arguments, newargs)
+  linker_args += phase_calculate_system_libraries(options)
 
   js_syms = {}
   if (not settings.SIDE_MODULE or settings.ASYNCIFY) and not shared.SKIP_SUBPROCS:
@@ -3117,11 +3240,11 @@ def run(linker_inputs, options, state, newargs):
       settings.ASYNCIFY_IMPORTS_EXCEPT_JS_LIBS = settings.ASYNCIFY_IMPORTS[:]
       settings.ASYNCIFY_IMPORTS += ['*.' + x for x in js_info['asyncFuncs']]
 
-  base_metadata = phase_link(linker_arguments, wasm_target, js_syms)
+  base_metadata = phase_link(linker_args, wasm_target, js_syms)
 
   # Special handling for when the user passed '-Wl,--version'.  In this case the linker
   # does not create the output file, but just prints its version and exits with 0.
-  if '--version' in linker_arguments:
+  if '--version' in linker_args:
     return 0
 
   # TODO(sbc): In theory we should really run the whole pipeline even if the output is
@@ -3131,6 +3254,6 @@ def run(linker_inputs, options, state, newargs):
 
   # Perform post-link steps (unless we are running bare mode)
   if options.oformat != OFormat.BARE:
-    phase_post_link(options, state, wasm_target, wasm_target, target, js_syms, base_metadata, linker_inputs)
+    phase_post_link(options, wasm_target, wasm_target, target, js_syms, base_metadata)
 
   return 0

@@ -246,10 +246,6 @@ std::string emval_test_take_and_return_std_string_const_ref(const std::string& s
   return str;
 }
 
-std::basic_string<unsigned char> emval_test_take_and_return_std_basic_string_unsigned_char(std::basic_string<unsigned char> str) {
-  return str;
-}
-
 std::wstring take_and_return_std_wstring(std::wstring str) {
   return str;
 }
@@ -889,6 +885,15 @@ std::map<std::string, int> embind_test_get_string_int_map() {
   return m;
 };
 
+std::map<int, std::string, std::greater<int>> embind_test_get_int_string_greater_map() {
+    std::map<int, std::string, std::greater<int>> m;
+
+    m[1] = "one";
+    m[2] = "two";
+
+    return m;
+}
+
 struct Vector {
   Vector() = delete;
 
@@ -1345,6 +1350,13 @@ int embind_test_optional_small_class_arg(std::optional<SmallClass> arg) {
 void embind_test_optional_multiple_arg(int arg1,
                                        std::optional<int> arg2,
                                        std::optional<int> arg3) {
+}
+
+struct StructWithOptionalProperty {
+  int x;
+  std::optional<int> y;
+};
+void embind_test_optional_property(const StructWithOptionalProperty &arg) {
 }
 #endif
 
@@ -1914,7 +1926,6 @@ EMSCRIPTEN_BINDINGS(tests) {
   //function("emval_test_take_and_return_const_char_star", &emval_test_take_and_return_const_char_star);
   function("emval_test_take_and_return_std_string", &emval_test_take_and_return_std_string);
   function("emval_test_take_and_return_std_string_const_ref", &emval_test_take_and_return_std_string_const_ref);
-  function("emval_test_take_and_return_std_basic_string_unsigned_char", &emval_test_take_and_return_std_basic_string_unsigned_char);
   function("take_and_return_std_wstring", &take_and_return_std_wstring);
   function("take_and_return_std_u16string", &take_and_return_std_u16string);
   function("take_and_return_std_u32string", &take_and_return_std_u32string);
@@ -2374,10 +2385,18 @@ EMSCRIPTEN_BINDINGS(tests) {
   function("embind_test_optional_string_arg", &embind_test_optional_string_arg);
   function("embind_test_optional_small_class_arg", &embind_test_optional_small_class_arg);
   function("embind_test_optional_multiple_arg", &embind_test_optional_multiple_arg);
+  value_object<StructWithOptionalProperty>("StructWithOptionalProperty")
+      .field("x", &StructWithOptionalProperty::x)
+      .field("y", &StructWithOptionalProperty::y)
+  ;
+  function("embind_test_optional_property", &embind_test_optional_property);
 #endif
 
   register_map<std::string, int>("StringIntMap");
   function("embind_test_get_string_int_map", embind_test_get_string_int_map);
+    
+  register_map<int, std::string, std::greater<int>>("IntStringMapGreater");
+  function("embind_test_get_int_string_greater_map", embind_test_get_int_string_greater_map);
 
   function("embind_test_getglobal", &embind_test_getglobal);
 

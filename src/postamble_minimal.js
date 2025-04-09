@@ -5,8 +5,6 @@
  */
 
 // === Auto-generated postamble setup entry stuff ===
-{{{ exportRuntime() }}}
-
 #if HAS_MAIN // Only if user is exporting a C main(), we will generate a run() function that can be used to launch main.
 function run() {
 #if MEMORYPROFILER
@@ -14,7 +12,6 @@ function run() {
 #endif
 
   <<< ATMAINS >>>
-
 #if PROXY_TO_PTHREAD
   // User requested the PROXY_TO_PTHREAD option, so call a stub main which
   // pthread_create()s a new thread that will call the user's real main() for
@@ -24,7 +21,6 @@ function run() {
   var ret = _main();
 
 #if EXIT_RUNTIME
-  callRuntimeCallbacks(__ATEXIT__);
   <<< ATEXITS >>>
 #if PTHREADS
   PThread.terminateAllThreads();
@@ -45,6 +41,7 @@ function run() {
 #if STACK_OVERFLOW_CHECK
   checkStackCookie();
 #endif
+  <<< ATPOSTRUNS >>>
 }
 #endif
 
@@ -73,27 +70,29 @@ function initRuntime(wasmExports) {
   PThread.tlsInitFunctions.push(wasmExports['_emscripten_tls_init']);
 #endif
 
+  <<< ATINITS >>>
+
 #if hasExportedSymbol('__wasm_call_ctors')
   wasmExports['__wasm_call_ctors']();
 #endif
 
-  <<< ATINITS >>>
+  <<< ATPOSTCTORS >>>
 }
 
 // Initialize wasm (asynchronous)
 
-// In non-fastcomp non-asm.js builds, grab wasm exports to outer scope
-// for emscripten_get_exported_function() to be able to access them.
-#if LibraryManager.has('library_exports.js')
+#if SINGLE_FILE && WASM == 1 && !WASM2JS
+Module['wasm'] = base64Decode('<<< WASM_BINARY_DATA >>>');
+#endif
+
+#if LibraryManager.has('libexports.js')
+// emscripten_get_exported_function() requires wasmExports to be defined in the
+// outer scope.
 var wasmExports;
 #endif
 
 #if PTHREADS
 var wasmModule;
-#endif
-
-#if DECLARE_ASM_MODULE_EXPORTS
-<<< WASM_MODULE_EXPORTS_DECLARES >>>
 #endif
 
 #if PTHREADS
@@ -135,10 +134,14 @@ WebAssembly.instantiateStreaming(fetch('{{{ TARGET_BASENAME }}}.wasm'), imports)
 if (!Module['wasm']) throw 'Must load WebAssembly Module in to variable Module.wasm before adding compiled output .js script to the DOM';
 #endif
 
+<<< ATMODULES >>>
+
+{{{ exportJSSymbols() }}}
+
 WebAssembly.instantiate(Module['wasm'], imports).then((output) => {
 #endif
 
-#if !LibraryManager.has('library_exports.js')
+#if !LibraryManager.has('libexports.js')
   // If not using the emscripten_get_exported_function() API, keep the
   // `wasmExports` variable in local scope to this instantiate function to save
   // code size.  (otherwise access it without to export it to outer scope)
@@ -183,7 +186,7 @@ WebAssembly.instantiate(Module['wasm'], imports).then((output) => {
 #if !DECLARE_ASM_MODULE_EXPORTS
   exportWasmSymbols(wasmExports);
 #else
-  <<< WASM_MODULE_EXPORTS >>>
+  assignWasmExports(wasmExports);
 #endif
 #if '$wasmTable' in addedLibraryItems
   wasmTable = wasmExports['__indirect_function_table'];
@@ -217,6 +220,7 @@ WebAssembly.instantiate(Module['wasm'], imports).then((output) => {
 #endif
   updateMemoryViews();
 #endif
+  <<< ATPRERUNS >>>
 
   initRuntime(wasmExports);
 #if PTHREADS
